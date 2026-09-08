@@ -161,6 +161,47 @@ def eval_map_cmc(qf, gf, q_pids, g_pids, q_seq_ids=None, g_seq_ids=None, intra_s
     
     return all_cmc, mAP, mINP, indices, matches
 
+def compute_tar_at_far(qf, gf, q_pids, g_pids, far_target=0.001):
+    """
+    Tính TAR@FAR=far_target dùng pairwise cosine similarity.
+    - Genuine pairs : (i, j) có q_pids[i] == g_pids[j]  (trừ cặp i==j)
+    - Impostor pairs: (i, j) có q_pids[i] != g_pids[j]
+    Tìm threshold sao cho FAR <= far_target, rồi tính TAR tương ứng.
+    """
+    qf_n = F.normalize(qf, p=2, dim=1).cpu().numpy()
+    gf_n = F.normalize(gf, p=2, dim=1).cpu().numpy()
+    sim = np.dot(qf_n, gf_n.T)          # (num_q, num_g)
+
+    q_pids = np.asarray(q_pids)
+    g_pids = np.asarray(g_pids)
+
+    num_q, num_g = sim.shape
+    genuine_scores  = []
+    impostor_scores = []
+
+    for i in range(num_q):
+        for j in range(num_g):
+            if i == j:      # loại self-match (query và gallery là cùng clip)
+                continue
+            if q_pids[i] == g_pids[j]:
+                genuine_scores.append(sim[i, j])
+            else:
+                impostor_scores.append(sim[i, j])
+
+    genuine_scores  = np.array(genuine_scores,  dtype=np.float32)
+    impostor_scores = np.array(impostor_scores, dtype=np.float32)
+
+    if len(impostor_scores) == 0 or len(genuine_scores) == 0:
+        return float('nan'), float('nan')
+
+    # Tìm threshold sao cho FAR <= far_target
+    # FAR(t) = P(impostor > t)  =>  sắp xếp giảm dần, lấy phần vị (1 - far_target)
+    threshold = np.quantile(impostor_scores, 1.0 - far_target)
+
+    tar = np.mean(genuine_scores >= threshold)
+    far = np.mean(impostor_scores >= threshold)
+    return float(tar), float(far)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.json", type=str, help="Path to config file")
@@ -274,19 +315,28 @@ def main():
     
     print("Computing metrics...")
     cmc, mAP, mINP, indices, matches = eval_map_cmc(qf, gf, q_pids, g_pids, q_seq_ids, g_seq_ids, args.intra_sequence)
+
+    print("Computing TAR@FAR=0.1%...")
+    tar_01, actual_far = compute_tar_at_far(qf, gf, q_pids, g_pids, far_target=0.001)
     
     print("\n=== OFFLINE REID EVALUATION (STATIC PROTOCOL) ===")
-    print(f"Rank-1 Accuracy: {cmc[0]*100:.2f}%")
-    print(f"Rank-5 Accuracy: {cmc[4]*100:.2f}%")
-    print(f"mAP            : {mAP*100:.2f}%")
-    print(f"mINP           : {mINP*100:.2f}%")
+    print(f"Rank-1 Accuracy  : {cmc[0]*100:.2f}%")
+    print(f"Rank-5 Accuracy  : {cmc[4]*100:.2f}%")
+    print(f"mAP              : {mAP*100:.2f}%")
+    print(f"mINP             : {mINP*100:.2f}%")
+    if not np.isnan(tar_01):
+        print(f"TAR@FAR=0.1%     : {tar_01*100:.2f}%  (actual FAR={actual_far*100:.4f}%)")
+    else:
+        print("TAR@FAR=0.1%     : N/A (không đủ genuine/impostor pairs)")
     
     # Save Report
     report = {
         "Rank-1": float(cmc[0]),
         "Rank-5": float(cmc[4]),
         "mAP": float(mAP),
-        "mINP": float(mINP)
+        "mINP": float(mINP),
+        "TAR@FAR=0.1%": float(tar_01) if not np.isnan(tar_01) else None,
+        "actual_FAR": float(actual_far) if not np.isnan(actual_far) else None,
     }
     with open(os.path.join(args.output_dir, "evaluation_report.json"), "w") as f:
         json.dump(report, f, indent=4)
