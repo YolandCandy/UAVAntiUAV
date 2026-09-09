@@ -71,20 +71,20 @@ eval:
   model_path: /content/best_model.pth
   query_json: /content/processed/query_test.json
   gallery_json: /content/processed/gallery_test.json
-  output_dir: /content/drive/MyDrive/UAV_Anti_UAV/eval_results
+  output_dir: /content/drive/MyDrive/UAV_Anti_UAV/eval_results/v3.8.3
   batch_size: 32             # Khi test không cần tính gradient nên để batch size rất lớn
   num_workers: 8
   backbone: "dinov3_convnext"
   backbone_only: false
   reid_threshold: 0.7
-  intra_sequence: true
+  intra_sequence: false
   # Dùng threshold đã calibrate từ calibrate_threshold.py (Fixed FAR strategy)
   # Chạy calibrate_threshold.py trước để tạo file này
-  threshold_file: /content/drive/MyDrive/UAV_Anti_UAV/calib_results/calibrated_threshold.json
+  threshold_file: /content/drive/MyDrive/UAV_Anti_UAV/calib_results/v3.8/calibrated_threshold.json
 
 # --- Threshold Calibration ---
 calibration:
-  output_dir: /content/drive/MyDrive/UAV_Anti_UAV/calib_results
+  output_dir: /content/drive/MyDrive/UAV_Anti_UAV/calib_results/v3.8
   cal_ratio: 0.4             # 40% sequences dùng để tìm threshold, 60% còn lại là holdout eval
   far_target: 0.001          # FAR mục tiêu = 0.1%
   seed: 42                   # Seed cố định để split reproducible
