@@ -205,6 +205,9 @@ def compute_tar_at_far(qf, gf, q_pids, g_pids, far_target=0.001):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.json", type=str, help="Path to config file")
+    parser.add_argument("--threshold-file", default=None, type=str,
+                        help="Path to calibrated_threshold.json (từ calibrate_threshold.py). "
+                             "Nếu không cung cấp, threshold sẽ được tính từ chính test set (in-sample, thiên lệch).")
     args = parser.parse_args()
 
     with open(args.config, 'r', encoding='utf-8') as f:
@@ -224,6 +227,10 @@ def main():
     args.num_frames    = cfg.get('train', {}).get('num_frames', 16)
     args.backbone      = ec.get('backbone', 'resnet50_ibn')
     args.gpu_jetson    = cfg.get('device', {}).get('gpu_jetson', False)
+    # threshold_file: CLI arg override config nếu được truyền vào
+    if args.threshold_file is None:
+        args.threshold_file = ec.get('threshold_file', None)
+
 
     os.makedirs(args.output_dir, exist_ok=True)
     
@@ -317,8 +324,59 @@ def main():
     cmc, mAP, mINP, indices, matches = eval_map_cmc(qf, gf, q_pids, g_pids, q_seq_ids, g_seq_ids, args.intra_sequence)
 
     print("Computing TAR@FAR=0.1%...")
-    tar_01, actual_far = compute_tar_at_far(qf, gf, q_pids, g_pids, far_target=0.001)
-    
+
+    # --- Load calibrated threshold (nếu có) hoặc tính in-sample ---
+    threshold_source = "in-sample (thiên lệch)"
+    calibrated_threshold = None
+
+    if args.threshold_file and os.path.exists(args.threshold_file):
+        with open(args.threshold_file, 'r') as f:
+            calib_data = json.load(f)
+        calibrated_threshold = calib_data.get('threshold')
+        threshold_source = (
+            f"calibrated (Fixed FAR<={calib_data.get('far_target',0.001)*100:.2f}%, "
+            f"cal_ratio={calib_data.get('cal_ratio','?')}, seed={calib_data.get('seed','?')})"
+        )
+        print(f"  Dùng calibrated threshold: {calibrated_threshold:.6f}  [{threshold_source}]")
+    elif args.threshold_file:
+        print(f"  WARNING: --threshold-file '{args.threshold_file}' không tìm thấy!")
+        print("           Fallback về in-sample threshold (thiên lệch).")
+
+    # Tính scores
+    qf_n = torch.nn.functional.normalize(qf, p=2, dim=1).cpu().numpy()
+    gf_n = torch.nn.functional.normalize(gf, p=2, dim=1).cpu().numpy()
+    sim_all = qf_n @ gf_n.T
+
+    q_pids_arr = np.array(q_pids)
+    g_pids_arr = np.array(g_pids)
+    genuine_scores, impostor_scores = [], []
+    for i in range(len(q_pids_arr)):
+        for j in range(len(g_pids_arr)):
+            if i == j:
+                continue
+            if q_pids_arr[i] == g_pids_arr[j]:
+                genuine_scores.append(sim_all[i, j])
+            else:
+                impostor_scores.append(sim_all[i, j])
+    genuine_scores  = np.array(genuine_scores,  dtype=np.float32)
+    impostor_scores = np.array(impostor_scores, dtype=np.float32)
+
+    if len(genuine_scores) == 0 or len(impostor_scores) == 0:
+        tar_01, actual_far = float('nan'), float('nan')
+    else:
+        if calibrated_threshold is not None:
+            # Unbiased: dùng threshold từ cal-split
+            t_star = calibrated_threshold
+        else:
+            # In-sample: tính trực tiếp từ test set (cảnh báo)
+            print("  WARNING: Đang dùng in-sample threshold - kết quả TAR@FAR sẽ bị thiên lệch cao!")
+            print("           Chạy calibrate_threshold.py trước để có kết quả đúng.")
+            t_star = float(np.quantile(impostor_scores, 1.0 - 0.001))
+
+        tar_01     = float(np.mean(genuine_scores  >= t_star))
+        actual_far = float(np.mean(impostor_scores >= t_star))
+
+
     print("\n=== OFFLINE REID EVALUATION (STATIC PROTOCOL) ===")
     print(f"Rank-1 Accuracy  : {cmc[0]*100:.2f}%")
     print(f"Rank-5 Accuracy  : {cmc[4]*100:.2f}%")
@@ -326,9 +384,10 @@ def main():
     print(f"mINP             : {mINP*100:.2f}%")
     if not np.isnan(tar_01):
         print(f"TAR@FAR=0.1%     : {tar_01*100:.2f}%  (actual FAR={actual_far*100:.4f}%)")
+        print(f"  [threshold={t_star:.6f}, source={threshold_source}]")
     else:
         print("TAR@FAR=0.1%     : N/A (không đủ genuine/impostor pairs)")
-    
+
     # Save Report
     report = {
         "Rank-1": float(cmc[0]),
@@ -337,9 +396,12 @@ def main():
         "mINP": float(mINP),
         "TAR@FAR=0.1%": float(tar_01) if not np.isnan(tar_01) else None,
         "actual_FAR": float(actual_far) if not np.isnan(actual_far) else None,
+        "threshold": float(t_star) if not np.isnan(tar_01) else None,
+        "threshold_source": threshold_source,
     }
     with open(os.path.join(args.output_dir, "evaluation_report.json"), "w") as f:
         json.dump(report, f, indent=4)
+
         
     # Pre-calculate similarity matrix for visualization and online eval
     qf_norm = F.normalize(qf, p=2, dim=1)

@@ -78,6 +78,17 @@ eval:
   backbone_only: false
   reid_threshold: 0.7
   intra_sequence: true
+  # Dùng threshold đã calibrate từ calibrate_threshold.py (Fixed FAR strategy)
+  # Chạy calibrate_threshold.py trước để tạo file này
+  threshold_file: /content/drive/MyDrive/UAV_Anti_UAV/calib_results/calibrated_threshold.json
+
+# --- Threshold Calibration ---
+calibration:
+  output_dir: /content/drive/MyDrive/UAV_Anti_UAV/calib_results
+  cal_ratio: 0.4             # 40% sequences dùng để tìm threshold, 60% còn lại là holdout eval
+  far_target: 0.001          # FAR mục tiêu = 0.1%
+  seed: 42                   # Seed cố định để split reproducible
+
 
 # --- Inference ---
 infer:
