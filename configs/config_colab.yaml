@@ -77,10 +77,11 @@ eval:
   backbone: "dinov3_convnext"
   backbone_only: false
   reid_threshold: 0.7
-  intra_sequence: false
+  intra_sequence: true
+  max_correct_vis: 0         # Tắt lưu ảnh để chạy nhanh và tiết kiệm dung lượng
   # Dùng threshold đã calibrate từ calibrate_threshold.py (Fixed FAR strategy)
   # Chạy calibrate_threshold.py trước để tạo file này
-  threshold_file: /content/drive/MyDrive/UAV_Anti_UAV/calib_results/v3.8/calibrated_threshold.json
+  threshold_file: /content/drive/MyDrive/UAV_Anti_UAV/calib_results/calibrated_threshold.json
 
 # --- Threshold Calibration ---
 calibration:

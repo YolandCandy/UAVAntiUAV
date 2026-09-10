@@ -58,3 +58,16 @@ python evaluate_reid.py --config configs/config_local.yaml \
 - Nếu có file: dùng calibrated threshold (unbiased), in `[source=calibrated]`
 - Nếu không có: fallback in-sample + **cảnh báo rõ ràng**
 - `evaluation_report.json` bổ sung `threshold` và `threshold_source`
+
+### Tối ưu thời gian chạy và dung lượng đánh giá
+- Bổ sung tuỳ chọn tắt hoàn toàn việc sinh ảnh trực quan (visualization) trong quá trình đánh giá. 
+- **Cách thực hiện:** Trong `evaluate_reid.py`, nếu tham số `max_correct_vis` được gán bằng `0`, chương trình sẽ bỏ qua toàn bộ khối lệnh vẽ ảnh và lưu ảnh (`Skipping visualization...`).
+- **Config:** Cập nhật `configs/config_colab.yaml` thêm `max_correct_vis: 0` vào block `eval`. Điều này giúp tiết kiệm đáng kể thời gian I/O và dung lượng lưu trữ trên Google Drive khi chạy đánh giá trên Colab.
+
+### Phân tích kết quả Calibration
+Dựa trên kết quả chạy thử nghiệm đầu tiên với DINOv3 ConvNeXt-Small:
+- **Ngưỡng tìm được (t*):** `0.852396` (tại `FAR ≤ 0.1%` trên tập calibration).
+- **Kết quả trên tập holdout eval:**
+  - **Actual FAR:** `0.1096%` (rất sát với target `0.1%`, chứng tỏ calibration hoạt động chính xác và không bị thiên lệch).
+  - **TAR:** `8.45%`.
+- **Nhận xét:** Model có khả năng xếp hạng tốt (Rank-1 `74.56%`, Rank-5 `85.36%`) nhưng các điểm số (scores) chưa đủ tách biệt tuyệt đối (absolute margin) để dùng làm ngưỡng cứng khắt khe. Phần lớn các cặp đúng có similarity `< 0.85`. Do đó, trong thực tế triển khai (inference), việc sử dụng ngưỡng thấp hơn (như `0.75`) để tránh bỏ sót (tăng TAR) và chấp nhận một lượng FAR nhất định là phương án thỏa hiệp hợp lý.

@@ -409,6 +409,13 @@ def main():
     sim_matrix = torch.mm(qf_norm, gf_norm.t()).cpu().numpy()
 
     # Visualization for all evaluation cases
+    if args.max_correct_vis == 0:
+        print("\nSkipping visualization (max_correct_vis = 0)...")
+        # Save empty eval_info just in case other scripts depend on the file
+        with open(os.path.join(args.output_dir, "eval_cases_info.json"), "w") as f:
+            json.dump({}, f)
+        return
+
     print("\nGenerating visualization for all evaluated cases (Contact Sheets)...")
     from PIL import ImageDraw, ImageFont
     try:
