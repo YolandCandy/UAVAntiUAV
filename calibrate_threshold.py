@@ -11,11 +11,19 @@ Chiến lược: Fixed FAR
 
 Output:
   <output_dir>/
-    calibrated_threshold.json   <- threshold + metadata
-    score_distribution.png      <- histogram genuine vs impostor (cal split)
-    det_curve.png               <- DET curve với t* được đánh dấu (cal split)
-    roc_curve_comparison.png    <- ROC cal vs eval trên cùng 1 plot
-    calibration_report.json     <- full report
+    calibrated_threshold.json   <- threshold + metadata ('threshold' = không gian chính,
+                                   'thresholds' = {fused, pre_bn} để dùng với evaluate_reid.py --space)
+    score_distribution_<space>.png  <- histogram genuine vs impostor (cal split)
+    det_curve_<space>.png           <- DET curve với t* được đánh dấu (cal split)
+    roc_curve_comparison_<space>.png<- ROC cal vs eval trên cùng 1 plot
+    calibration_report.json     <- full report ('spaces' = bảng so sánh 2 không gian)
+
+Không gian feature (🛠️ 14/9):
+  fused  (mặc định, hành vi cũ) : qua ReIDHead (BatchNorm1d)
+  pre_bn                        : cat(visual, temporal) — ĐẦU VÀO bnneck (raw)
+  Cả hai được calibrate trong cùng 1 lượt chạy với CÙNG một quy trình Fixed-FAR, để trả lời
+  dứt khoát: BatchNorm1d có thật sự làm mất khả năng phân biệt, hay chỉ nén thang điểm?
+  (xem md/15thg9.md)
 
 Usage:
   python calibrate_threshold.py --config configs/config_local.yaml \\
@@ -111,17 +119,39 @@ class CalibDataset(Dataset):
 
 
 # Feature extraction
-def extract_features(model, dataloader, backbone_only=False):
-    qf, gf, pids = [], [], []
+def extract_features(model, dataloader, backbone_only=False, spaces=('fused',)):
+    """
+    Trích feature cho (các) không gian đánh giá trong MỘT lượt chạy backbone.
+
+    spaces:
+      'fused'    : qua ReIDHead (BatchNorm1d) — pipeline hiện tại (fine score)
+      'pre_bn'   : cat(visual, temporal) — ĐẦU VÀO của bnneck (raw);
+                   dùng để kiểm chứng giả thuyết "BatchNorm1d phá cosine" (xem md/15thg9.md)
+      'backbone' : chỉ visual backbone (chỉ dùng khi backbone_only=True)
+
+    Return: (feats, pids) với feats[space] = (qf, gf) đã concat theo batch.
+    """
+    acc = {s: {'qf': [], 'gf': []} for s in spaces}
+    pids = []
     with torch.no_grad():
         for before, after, pid in dataloader:
             before, after = before.cuda(), after.cuda()
-            gf.append(model(before, backbone_only=backbone_only).cpu())
-            qf.append(model(after,  backbone_only=backbone_only).cpu())
+            if backbone_only:
+                acc['backbone']['gf'].append(model(before, backbone_only=True).cpu())
+                acc['backbone']['qf'].append(model(after,  backbone_only=True).cpu())
+            else:
+                v_g, t_g, _ = model.extract_features(before)
+                v_q, t_q, _ = model.extract_features(after)
+                if 'fused' in spaces:
+                    acc['fused']['gf'].append(model.head(v_g, t_g).cpu())
+                    acc['fused']['qf'].append(model.head(v_q, t_q).cpu())
+                if 'pre_bn' in spaces:
+                    acc['pre_bn']['gf'].append(torch.cat([v_g, t_g], dim=-1).cpu())
+                    acc['pre_bn']['qf'].append(torch.cat([v_q, t_q], dim=-1).cpu())
             pids.extend(pid.numpy().tolist())
-    qf = torch.cat(qf, dim=0)
-    gf = torch.cat(gf, dim=0)
-    return qf, gf, np.array(pids)
+
+    feats = {s: (torch.cat(acc[s]['qf'], dim=0), torch.cat(acc[s]['gf'], dim=0)) for s in spaces}
+    return feats, np.array(pids)
 
 
 # Score computation
@@ -339,19 +369,11 @@ def main():
     if gasnet_dir:
         os.environ['GASNET_PATH'] = os.path.abspath(gasnet_dir)
 
-    from model import UAVReIDNet
+    from model import UAVReIDNet, load_checkpoint_verbose
     model = UAVReIDNet(freeze_backbone=False, backbone=backbone)
     if not backbone_only and os.path.exists(model_path):
-        checkpoint = torch.load(model_path, map_location='cpu')
-        state_dict = checkpoint.get('model_state_dict', checkpoint)
-        model_state = model.state_dict()
-        new_sd = {}
-        for k, v in state_dict.items():
-            new_k = k.replace('_orig_mod.', '') if k.startswith('_orig_mod.') else k
-            if new_k in model_state and v.shape != model_state[new_k].shape:
-                continue
-            new_sd[new_k] = v
-        model.load_state_dict(new_sd, strict=False)
+        # 🛠️ (14/9): báo cáo đầy đủ missing/unexpected/shape-mismatch (xem model.load_checkpoint_verbose)
+        load_checkpoint_verbose(model, model_path, tag="calibrate")
         print(f"  Loaded weights: {model_path}")
     else:
         print(f"  WARNING: {model_path} not found -- using random weights!")
@@ -368,7 +390,13 @@ def main():
     test_dir = os.path.join(data_dir, 'test')
 
     # 3. Extract features
+    # 🛠️ (14/9): trích đồng thời 2 không gian để trả lời câu hỏi
+    # "BatchNorm1d trong ReIDHead có thật sự làm mất khả năng phân biệt không?"
+    #   fused  = qua head (BatchNorm1d) — pipeline hiện tại
+    #   pre_bn = cat(visual, temporal)  — đầu vào bnneck (raw)
+    spaces = ['backbone'] if backbone_only else ['fused', 'pre_bn']
     print("\n[3/5] Extracting features...")
+    print(f"  Spaces    : {', '.join(spaces)}")
     print(f"  -> Cal split ({len(cal_seqs)} sequences)...")
     t0 = time.time()
     ds_cal = CalibDataset(test_dir, query_json, gallery_json,
@@ -378,7 +406,7 @@ def main():
         raise RuntimeError("Cal split rong! Tang --cal-ratio hoac kiem tra query/gallery JSON.")
     dl_cal = DataLoader(ds_cal, batch_size=batch_size, shuffle=False,
                         num_workers=num_workers, pin_memory=True)
-    qf_cal, gf_cal, pids_cal = extract_features(model, dl_cal, backbone_only)
+    feats_cal, pids_cal = extract_features(model, dl_cal, backbone_only, spaces)
     print(f"     {len(ds_cal)} pairs, {time.time()-t0:.1f}s")
 
     print(f"  -> Eval split ({len(eval_seqs)} sequences)...")
@@ -390,27 +418,72 @@ def main():
         raise RuntimeError("Eval split rong! Giam --cal-ratio.")
     dl_eval = DataLoader(ds_eval, batch_size=batch_size, shuffle=False,
                          num_workers=num_workers, pin_memory=True)
-    qf_eval, gf_eval, pids_eval = extract_features(model, dl_eval, backbone_only)
+    feats_eval, pids_eval = extract_features(model, dl_eval, backbone_only, spaces)
     print(f"     {len(ds_eval)} pairs, {time.time()-t0:.1f}s")
 
-    # 4. Compute scores
+    # 4. Compute scores (cho từng không gian)
     print("\n[4/5] Computing pairwise scores...")
-    print("  -> Cal split...")
-    gen_cal, imp_cal = compute_scores(qf_cal, gf_cal, pids_cal, pids_cal)
-    print(f"     genuine={len(gen_cal):,}  impostor={len(imp_cal):,}")
-    print("  -> Eval split...")
-    gen_eval, imp_eval = compute_scores(qf_eval, gf_eval, pids_eval, pids_eval)
-    print(f"     genuine={len(gen_eval):,}  impostor={len(imp_eval):,}")
+    scores = {}
+    for s in spaces:
+        qf_cal, gf_cal = feats_cal[s]
+        qf_eval, gf_eval = feats_eval[s]
+        gen_cal, imp_cal = compute_scores(qf_cal, gf_cal, pids_cal, pids_cal)
+        gen_eval, imp_eval = compute_scores(qf_eval, gf_eval, pids_eval, pids_eval)
+        scores[s] = {'gen_cal': gen_cal, 'imp_cal': imp_cal,
+                     'gen_eval': gen_eval, 'imp_eval': imp_eval}
+        print(f"  [{s}] cal: genuine={len(gen_cal):,} impostor={len(imp_cal):,} | "
+              f"eval: genuine={len(gen_eval):,} impostor={len(imp_eval):,}")
 
-    if len(imp_cal) == 0:
-        raise RuntimeError("Khong co impostor pairs o cal-split. Tang --cal-ratio.")
-
-    # 5. Calibrate
+    # 5. Calibrate (từng không gian, cùng một quy trình Fixed-FAR → so sánh được)
     print("\n[5/5] Calibrating threshold (Fixed FAR)...")
-    t_star, cal_actual_far = calibrate_fixed_far(imp_cal, far_target)
-    cal_tar, _, cal_frr = eval_at_threshold(gen_cal, imp_cal, t_star)
+    results = {}
+    for s in spaces:
+        sc = scores[s]
+        if len(sc['imp_cal']) == 0 or len(sc['gen_cal']) == 0:
+            print(f"  [{s}] SKIP: cal-split thiếu genuine/impostor pairs. Tang --cal-ratio.")
+            continue
+        t_star, cal_actual_far = calibrate_fixed_far(sc['imp_cal'], far_target)
+        cal_tar, _, cal_frr = eval_at_threshold(sc['gen_cal'], sc['imp_cal'], t_star)
+        eval_tar, eval_actual_far, eval_frr = eval_at_threshold(sc['gen_eval'], sc['imp_eval'], t_star)
+        results[s] = {
+            'threshold': float(t_star),
+            'cal_actual_far': float(cal_actual_far), 'cal_tar': float(cal_tar), 'cal_frr': float(cal_frr),
+            'eval_tar': float(eval_tar), 'eval_far': float(eval_actual_far), 'eval_frr': float(eval_frr),
+            'n_genuine_cal': int(len(sc['gen_cal'])), 'n_impostor_cal': int(len(sc['imp_cal'])),
+            'n_genuine_eval': int(len(sc['gen_eval'])), 'n_impostor_eval': int(len(sc['imp_eval'])),
+        }
 
-    print(f"\n  +-- Calibration Result (cal-split) ---------------+")
+    if not results:
+        raise RuntimeError("Khong calibrate duoc khong gian nao (thieu impostor pairs o cal-split).")
+
+    primary = spaces[0] if spaces[0] in results else next(iter(results))
+
+    # 5b. Bảng so sánh không gian — đây là kết luận chính của lần chạy
+    print(f"\n  === SO SANH KHONG GIAN DAC TRUNG (Fixed FAR <= {far_target*100:.2f}%) ===")
+    print(f"  {'Space':<10} {'t*':>10} {'TAR@t* (cal)':>13} {'TAR@t* (eval)':>14} {'FAR@t* (eval)':>14}")
+    for s, r in results.items():
+        print(f"  {s:<10} {r['threshold']:>10.6f} {r['cal_tar']*100:>12.2f}% "
+              f"{r['eval_tar']*100:>13.2f}% {r['eval_far']*100:>13.4f}%")
+    if 'fused' in results and 'pre_bn' in results:
+        d_tar = results['pre_bn']['eval_tar'] - results['fused']['eval_tar']
+        verdict = ("pre_bn TOT HON ro ret -> BatchNorm1d that su lam mat kha nang phan biet"
+                   if d_tar > 0.02 else
+                   "pre_bn KEM HON -> BN chi nen thang diem, KHONG lam mat thong tin"
+                   if d_tar < -0.02 else
+                   "pre_bn ~= fused -> BN vo hai ve mat phan biet; chi can calibrate lai threshold")
+        print(f"\n  ΔTAR(eval, pre_bn - fused) = {d_tar*100:+.2f}%  -> {verdict}")
+
+    t_star = results[primary]['threshold']
+    cal_actual_far = results[primary]['cal_actual_far']
+    cal_tar = results[primary]['cal_tar']
+    cal_frr = results[primary]['cal_frr']
+    eval_tar = results[primary]['eval_tar']
+    eval_actual_far = results[primary]['eval_far']
+    eval_frr = results[primary]['eval_frr']
+    gen_cal, imp_cal = scores[primary]['gen_cal'], scores[primary]['imp_cal']
+    gen_eval, imp_eval = scores[primary]['gen_eval'], scores[primary]['imp_eval']
+
+    print(f"\n  +-- Calibration Result (cal-split, space={primary}) ---+")
     print(f"  | Threshold t*     : {t_star:.6f}                  |")
     print(f"  | FAR target       : {far_target*100:.4f}%                    |")
     print(f"  | Actual FAR (cal) : {cal_actual_far*100:.4f}%                    |")
@@ -418,8 +491,7 @@ def main():
     print(f"  | FRR @ t* (cal)   : {cal_frr*100:.2f}%                     |")
     print(f"  +-------------------------------------------------+")
 
-    eval_tar, eval_actual_far, eval_frr = eval_at_threshold(gen_eval, imp_eval, t_star)
-    print(f"\n  +-- Holdout Eval Result (eval-split) -------------+")
+    print(f"\n  +-- Holdout Eval Result (eval-split, space={primary}) --+")
     print(f"  | Threshold t*     : {t_star:.6f}  (from cal)      |")
     print(f"  | TAR @ t* (eval)  : {eval_tar*100:.2f}%                     |")
     print(f"  | FAR @ t* (eval)  : {eval_actual_far*100:.4f}%                    |")
@@ -429,7 +501,10 @@ def main():
     # Save threshold
     threshold_out = os.path.join(output_dir, 'calibrated_threshold.json')
     threshold_data = {
+        # 'threshold' giữ = không gian chính (fused) để tương thích ngược với evaluate_reid.py
         'threshold': float(t_star),
+        'space': primary,
+        'thresholds': {s: float(r['threshold']) for s, r in results.items()},
         'far_target': float(far_target),
         'cal_ratio': float(cal_ratio),
         'seed': seed,
@@ -451,6 +526,9 @@ def main():
             'n_cal_samples': len(ds_cal),
             'n_eval_samples': len(ds_eval),
         },
+        'primary_space': primary,
+        'spaces': results,
+        # backward compat: giữ nguyên hình dạng cũ cho không gian chính
         'calibration': {
             'threshold': float(t_star),
             'far_target': float(far_target),
@@ -475,19 +553,25 @@ def main():
     print(f"\n  Saved: {threshold_out}")
     print(f"  Saved: {report_out}")
 
-    # Plots
+    # Plots (mỗi không gian 1 bộ; tên file có hậu tố space khi >1 không gian)
     if HAS_MPL:
         print("\n  Generating plots...")
-        plot_score_distribution(gen_cal, imp_cal, t_star, far_target,
-                                os.path.join(output_dir, 'score_distribution.png'))
-        plot_det_curve(gen_cal, imp_cal, t_star, far_target,
-                       os.path.join(output_dir, 'det_curve.png'))
-        plot_roc_comparison(gen_cal, imp_cal, gen_eval, imp_eval, t_star, far_target,
-                            os.path.join(output_dir, 'roc_curve_comparison.png'))
+        for s in results:
+            sc = scores[s]
+            suffix = f"_{s}" if len(results) > 1 else ""
+            plot_score_distribution(sc['gen_cal'], sc['imp_cal'], results[s]['threshold'], far_target,
+                                    os.path.join(output_dir, f'score_distribution{suffix}.png'))
+            plot_det_curve(sc['gen_cal'], sc['imp_cal'], results[s]['threshold'], far_target,
+                           os.path.join(output_dir, f'det_curve{suffix}.png'))
+            plot_roc_comparison(sc['gen_cal'], sc['imp_cal'], sc['gen_eval'], sc['imp_eval'],
+                                results[s]['threshold'], far_target,
+                                os.path.join(output_dir, f'roc_curve_comparison{suffix}.png'))
 
     print(f"\n{'='*60}")
     print(f"  DONE. Dung threshold trong evaluate_reid.py:")
-    print(f"    --threshold-file {threshold_out}")
+    print(f"    --threshold-file {threshold_out}                 (space={primary})")
+    if 'pre_bn' in results:
+        print(f"    --threshold-file {threshold_out} --space pre_bn  (so sanh)")
     print(f"{'='*60}\n")
 
 

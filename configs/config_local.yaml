@@ -80,7 +80,12 @@ infer:
   output_video: output_reid.mp4
   out_dir: ./infer_output/infer_pipeline_3
   stride: 2
-  num_frames: 8
+  # 🛠️ FIX (14/9): PHẢI khớp `train.num_frames` (đang = 16).
+  # Trước đây = 8 → Mamba + mean-pooling chạy 8 token trong khi train 16
+  # → phân phối temporal token lệch sẵn, rồi bnneck khuếch đại → fine score tụt.
+  # Đánh đổi: cửa sổ dài hơn thì khó thu đủ trong đoạn tái xuất ngắn
+  # (xem md/15thg9.md §5 — cần resample/pad lên đủ num_frames).
+  num_frames: 16
   bbox_padding: 0.2
   max_anchor_size: 5
   max_recent_size: 15
@@ -89,3 +94,5 @@ infer:
   hijack_threshold: 0.40
   hijack_check_count: 5
   update_interval_sec: 2.0
+  # 🛠️ (14/9): in cosine TRƯỚC bnneck (raw) vs SAU bnneck (fused). Mặc định true trong code.
+  debug_sim: true

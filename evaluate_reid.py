@@ -161,12 +161,18 @@ def eval_map_cmc(qf, gf, q_pids, g_pids, q_seq_ids=None, g_seq_ids=None, intra_s
     
     return all_cmc, mAP, mINP, indices, matches
 
-def compute_tar_at_far(qf, gf, q_pids, g_pids, far_target=0.001):
+def compute_tar_at_far(qf, gf, q_pids, g_pids, far_target=0.001, threshold=None):
     """
     Tính TAR@FAR=far_target dùng pairwise cosine similarity.
     - Genuine pairs : (i, j) có q_pids[i] == g_pids[j]  (trừ cặp i==j)
     - Impostor pairs: (i, j) có q_pids[i] != g_pids[j]
-    Tìm threshold sao cho FAR <= far_target, rồi tính TAR tương ứng.
+
+    threshold=None  -> in-sample: tự tìm t* = quantile(impostor, 1-far_target) từ chính
+                       dữ liệu này (THIÊN LỆCH, nhưng dùng để so sánh CÔNG BẰNG giữa các
+                       không gian đặc trưng vì cùng một quy trình).
+    threshold=<float> -> dùng threshold ngoài (đã calibrate trên cal-split → không thiên lệch).
+
+    Trả về (tar, far, threshold_đã_dùng).
     """
     qf_n = F.normalize(qf, p=2, dim=1).cpu().numpy()
     gf_n = F.normalize(gf, p=2, dim=1).cpu().numpy()
@@ -192,15 +198,16 @@ def compute_tar_at_far(qf, gf, q_pids, g_pids, far_target=0.001):
     impostor_scores = np.array(impostor_scores, dtype=np.float32)
 
     if len(impostor_scores) == 0 or len(genuine_scores) == 0:
-        return float('nan'), float('nan')
+        return float('nan'), float('nan'), float('nan')
 
     # Tìm threshold sao cho FAR <= far_target
     # FAR(t) = P(impostor > t)  =>  sắp xếp giảm dần, lấy phần vị (1 - far_target)
-    threshold = np.quantile(impostor_scores, 1.0 - far_target)
+    t_star = float(threshold) if threshold is not None \
+        else float(np.quantile(impostor_scores, 1.0 - far_target))
 
-    tar = np.mean(genuine_scores >= threshold)
-    far = np.mean(impostor_scores >= threshold)
-    return float(tar), float(far)
+    tar = float(np.mean(genuine_scores >= t_star))
+    far = float(np.mean(impostor_scores >= t_star))
+    return tar, far, t_star
 
 def main():
     parser = argparse.ArgumentParser()
@@ -208,6 +215,10 @@ def main():
     parser.add_argument("--threshold-file", default=None, type=str,
                         help="Path to calibrated_threshold.json (từ calibrate_threshold.py). "
                              "Nếu không cung cấp, threshold sẽ được tính từ chính test set (in-sample, thiên lệch).")
+    parser.add_argument("--space", default=None, type=str, choices=["fused", "pre_bn"],
+                        help="Không gian feature dùng làm CHÍNH (áp calibrated threshold + visualization). "
+                             "fused = qua ReIDHead (BatchNorm1d) — mặc định; pre_bn = cat(visual, temporal), "
+                             "ĐẦU VÀO bnneck. Cả hai không gian luôn được đánh giá để so sánh (xem md/15thg9.md).")
     args = parser.parse_args()
 
     with open(args.config, 'r', encoding='utf-8') as f:
@@ -230,6 +241,8 @@ def main():
     # threshold_file: CLI arg override config nếu được truyền vào
     if args.threshold_file is None:
         args.threshold_file = ec.get('threshold_file', None)
+    # space: CLI arg override config; mặc định 'fused' (giữ nguyên hành vi cũ)
+    args.space = args.space or ec.get('space', 'fused')
 
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -264,22 +277,12 @@ def main():
     if gasnet_dir:
         os.environ['GASNET_PATH'] = os.path.abspath(gasnet_dir)
         
-    from model import UAVReIDNet
+    from model import UAVReIDNet, load_checkpoint_verbose
     model = UAVReIDNet(freeze_backbone=False, backbone=args.backbone)
     if not args.backbone_only:
         if os.path.exists(args.model_path):
-            checkpoint = torch.load(args.model_path, map_location='cpu')
-            state_dict = checkpoint.get('model_state_dict', checkpoint)
-            # Remove '_orig_mod.' prefix added by torch.compile
-            new_state_dict = {}
-            model_state = model.state_dict()
-            for k, v in state_dict.items():
-                new_k = k.replace('_orig_mod.', '') if k.startswith('_orig_mod.') else k
-                # Only load if the shape matches, to avoid strict=False still raising size mismatch
-                if new_k in model_state and v.shape != model_state[new_k].shape:
-                    continue
-                new_state_dict[new_k] = v
-            model.load_state_dict(new_state_dict, strict=False)
+            # 🛠️ (14/9): báo cáo đầy đủ missing/unexpected/shape-mismatch thay vì "Loaded" mù quáng.
+            load_checkpoint_verbose(model, args.model_path, tag="eval")
             print(f"Loaded {args.model_path}")
         else:
             print(f"Warning: {args.model_path} not found! Mamba head has random weights. (Use --backbone-only to evaluate pure GASNet)")
@@ -288,22 +291,43 @@ def main():
     model.cuda()
     model.eval()
     
-    qf, gf = [], []
+    # 🛠️ (14/9): trích đồng thời 2 không gian trong MỘT lượt backbone:
+    #   fused  = qua ReIDHead (BatchNorm1d) — pipeline hiện tại (fine score)
+    #   pre_bn = cat(visual, temporal)      — ĐẦU VÀO bnneck (raw)
+    # Cả hai được đánh giá bằng CÙNG một quy trình để trả lời: BatchNorm1d có thật sự
+    # làm mất khả năng phân biệt, hay chỉ nén thang điểm? (xem md/15thg9.md)
+    if args.backbone_only:
+        spaces = ['backbone']
+    elif args.space == 'pre_bn':
+        spaces = ['pre_bn', 'fused']
+    else:
+        spaces = ['fused', 'pre_bn']
+    threshold_space = args.space if args.space in spaces else spaces[0]
+
+    feats = {s: {'qf': [], 'gf': []} for s in spaces}
     q_pids, g_pids = [], []
     q_seq_ids, g_seq_ids = [], []
     attributes_list = []
     vis_paths_q, vis_paths_g = [], []
     
-    print("Extracting features...")
+    print(f"Extracting features... (spaces: {', '.join(spaces)})")
     start_time = time.time()
     with torch.no_grad():
         for i, (before, after, pids, attrs, v_q, v_g, seq_ids) in enumerate(dataloader):
             before, after = before.cuda(), after.cuda()
-            bn_feat_g = model(before, backbone_only=args.backbone_only)
-            bn_feat_q = model(after, backbone_only=args.backbone_only)
+            if args.backbone_only:
+                feats['backbone']['gf'].append(model(before, backbone_only=True))
+                feats['backbone']['qf'].append(model(after, backbone_only=True))
+            else:
+                v_g_t, t_g, _ = model.extract_features(before)
+                v_q_t, t_q, _ = model.extract_features(after)
+                if 'fused' in spaces:
+                    feats['fused']['gf'].append(model.head(v_g_t, t_g))
+                    feats['fused']['qf'].append(model.head(v_q_t, t_q))
+                if 'pre_bn' in spaces:
+                    feats['pre_bn']['gf'].append(torch.cat([v_g_t, t_g], dim=-1))
+                    feats['pre_bn']['qf'].append(torch.cat([v_q_t, t_q], dim=-1))
             
-            gf.append(bn_feat_g)
-            qf.append(bn_feat_q)
             g_pids.extend(pids.numpy())
             q_pids.extend(pids.numpy())
             q_seq_ids.extend(seq_ids)
@@ -317,87 +341,114 @@ def main():
                 print(f"  -> Đã trích xuất {i + 1}/{len(dataloader)} batches (Mất {elapsed:.2f}s)")
                 start_time = time.time()
             
-    qf = torch.cat(qf, dim=0)
-    gf = torch.cat(gf, dim=0)
-    
-    print("Computing metrics...")
-    cmc, mAP, mINP, indices, matches = eval_map_cmc(qf, gf, q_pids, g_pids, q_seq_ids, g_seq_ids, args.intra_sequence)
+    for s in spaces:
+        feats[s]['qf'] = torch.cat(feats[s]['qf'], dim=0)
+        feats[s]['gf'] = torch.cat(feats[s]['gf'], dim=0)
 
-    print("Computing TAR@FAR=0.1%...")
-
-    # --- Load calibrated threshold (nếu có) hoặc tính in-sample ---
+    # --- Load calibrated threshold (nếu có) ---
     threshold_source = "in-sample (thiên lệch)"
     calibrated_threshold = None
 
     if args.threshold_file and os.path.exists(args.threshold_file):
         with open(args.threshold_file, 'r') as f:
             calib_data = json.load(f)
-        calibrated_threshold = calib_data.get('threshold')
+        thresholds_by_space = calib_data.get('thresholds', {}) or {}
+        # Ưu tiên threshold calibrate riêng cho không gian được chọn (--space)
+        calibrated_threshold = thresholds_by_space.get(threshold_space, calib_data.get('threshold'))
         threshold_source = (
-            f"calibrated (Fixed FAR<={calib_data.get('far_target',0.001)*100:.2f}%, "
+            f"calibrated[{threshold_space}] (Fixed FAR<={calib_data.get('far_target',0.001)*100:.2f}%, "
             f"cal_ratio={calib_data.get('cal_ratio','?')}, seed={calib_data.get('seed','?')})"
         )
-        print(f"  Dùng calibrated threshold: {calibrated_threshold:.6f}  [{threshold_source}]")
+        print(f"  Dùng calibrated threshold ({threshold_space}): {calibrated_threshold:.6f}  [{threshold_source}]")
     elif args.threshold_file:
         print(f"  WARNING: --threshold-file '{args.threshold_file}' không tìm thấy!")
         print("           Fallback về in-sample threshold (thiên lệch).")
 
-    # Tính scores
-    qf_n = torch.nn.functional.normalize(qf, p=2, dim=1).cpu().numpy()
-    gf_n = torch.nn.functional.normalize(gf, p=2, dim=1).cpu().numpy()
-    sim_all = qf_n @ gf_n.T
+    # --- Tính metric cho TỪNG không gian bằng CÙNG một quy trình ---
+    print("Computing metrics...")
+    results = {}
+    artifacts = {}
+    for s in spaces:
+        qf_s, gf_s = feats[s]['qf'], feats[s]['gf']
+        cmc, mAP, mINP, indices, matches = eval_map_cmc(
+            qf_s, gf_s, q_pids, g_pids, q_seq_ids, g_seq_ids, args.intra_sequence)
+        tar_is, far_is, thr_is = compute_tar_at_far(qf_s, gf_s, q_pids, g_pids,
+                                                    far_target=0.001, threshold=None)
+        results[s] = {
+            'rank1': float(cmc[0]), 'rank5': float(cmc[4]),
+            'mAP': float(mAP), 'mINP': float(mINP),
+            'tar_at_far_0.1_in_sample': float(tar_is),
+            'far_in_sample': float(far_is),
+            'threshold_in_sample': float(thr_is),
+            'tar_at_far_0.1_calibrated': None,
+            'far_calibrated': None,
+            'threshold_calibrated': None,
+        }
+        if s == threshold_space and calibrated_threshold is not None:
+            tar_c, far_c, thr_c = compute_tar_at_far(qf_s, gf_s, q_pids, g_pids,
+                                                     far_target=0.001, threshold=calibrated_threshold)
+            results[s].update({
+                'tar_at_far_0.1_calibrated': float(tar_c),
+                'far_calibrated': float(far_c),
+                'threshold_calibrated': float(thr_c),
+            })
+        artifacts[s] = (cmc, mAP, mINP, indices, matches)
 
-    q_pids_arr = np.array(q_pids)
-    g_pids_arr = np.array(g_pids)
-    genuine_scores, impostor_scores = [], []
-    for i in range(len(q_pids_arr)):
-        for j in range(len(g_pids_arr)):
-            if i == j:
-                continue
-            if q_pids_arr[i] == g_pids_arr[j]:
-                genuine_scores.append(sim_all[i, j])
-            else:
-                impostor_scores.append(sim_all[i, j])
-    genuine_scores  = np.array(genuine_scores,  dtype=np.float32)
-    impostor_scores = np.array(impostor_scores, dtype=np.float32)
-
-    if len(genuine_scores) == 0 or len(impostor_scores) == 0:
-        tar_01, actual_far = float('nan'), float('nan')
-    else:
-        if calibrated_threshold is not None:
-            # Unbiased: dùng threshold từ cal-split
-            t_star = calibrated_threshold
-        else:
-            # In-sample: tính trực tiếp từ test set (cảnh báo)
-            print("  WARNING: Đang dùng in-sample threshold - kết quả TAR@FAR sẽ bị thiên lệch cao!")
-            print("           Chạy calibrate_threshold.py trước để có kết quả đúng.")
-            t_star = float(np.quantile(impostor_scores, 1.0 - 0.001))
-
-        tar_01     = float(np.mean(genuine_scores  >= t_star))
-        actual_far = float(np.mean(impostor_scores >= t_star))
-
+    primary_space = args.space if args.space in results else spaces[0]
+    cmc, mAP, mINP, indices, matches = artifacts[primary_space]
+    qf, gf = feats[primary_space]['qf'], feats[primary_space]['gf']
 
     print("\n=== OFFLINE REID EVALUATION (STATIC PROTOCOL) ===")
-    print(f"Rank-1 Accuracy  : {cmc[0]*100:.2f}%")
-    print(f"Rank-5 Accuracy  : {cmc[4]*100:.2f}%")
-    print(f"mAP              : {mAP*100:.2f}%")
-    print(f"mINP             : {mINP*100:.2f}%")
+    print(f"Không gian chính : {primary_space}   |   So sánh: {', '.join(results.keys())}")
+    print(f"  {'Space':<9} {'Rank-1':>8} {'Rank-5':>8} {'mAP':>8} {'mINP':>8} "
+          f"{'TAR@FAR=0.1%':>14} {'thr(in-sample)':>15}")
+    for s, r in results.items():
+        print(f"  {s:<9} {r['rank1']*100:>7.2f}% {r['rank5']*100:>7.2f}% "
+              f"{r['mAP']*100:>7.2f}% {r['mINP']*100:>7.2f}% "
+              f"{r['tar_at_far_0.1_in_sample']*100:>13.2f}% {r['threshold_in_sample']:>15.6f}")
+    if 'fused' in results and 'pre_bn' in results:
+        d_tar = results['pre_bn']['tar_at_far_0.1_in_sample'] - results['fused']['tar_at_far_0.1_in_sample']
+        d_rank1 = results['pre_bn']['rank1'] - results['fused']['rank1']
+        print(f"\n  Delta(pre_bn - fused): Rank-1 {d_rank1*100:+.2f}% | TAR@FAR=0.1% {d_tar*100:+.2f}%"
+              f"   (cùng quy trình in-sample -> so sánh được)")
+        if d_tar > 0.02:
+            print("  -> pre_bn TỐT HƠN rõ rệt: BatchNorm1d thật sự làm mất khả năng phân biệt.")
+        elif d_tar < -0.02:
+            print("  -> pre_bn KÉM HƠN: BN chỉ nén thang điểm, KHÔNG làm mất thông tin.")
+        else:
+            print("  -> pre_bn ~ fused: BN vô hại về mặt phân biệt; chỉ cần calibrate lại threshold.")
+
+    primary = results[primary_space]
+    tar_01 = primary['tar_at_far_0.1_calibrated']
+    actual_far = primary['far_calibrated']
+    t_star = primary['threshold_calibrated']
+    if tar_01 is None:
+        tar_01 = primary['tar_at_far_0.1_in_sample']
+        actual_far = primary['far_in_sample']
+        t_star = primary['threshold_in_sample']
+
+    print(f"\nRank-1 Accuracy  : {primary['rank1']*100:.2f}%")
+    print(f"Rank-5 Accuracy  : {primary['rank5']*100:.2f}%")
+    print(f"mAP              : {primary['mAP']*100:.2f}%")
+    print(f"mINP             : {primary['mINP']*100:.2f}%")
     if not np.isnan(tar_01):
         print(f"TAR@FAR=0.1%     : {tar_01*100:.2f}%  (actual FAR={actual_far*100:.4f}%)")
         print(f"  [threshold={t_star:.6f}, source={threshold_source}]")
     else:
         print("TAR@FAR=0.1%     : N/A (không đủ genuine/impostor pairs)")
 
-    # Save Report
+    # Save Report (flat keys = không gian chính -> tương thích ngược; 'spaces' = bảng so sánh)
     report = {
-        "Rank-1": float(cmc[0]),
-        "Rank-5": float(cmc[4]),
-        "mAP": float(mAP),
-        "mINP": float(mINP),
+        "Rank-1": float(primary['rank1']),
+        "Rank-5": float(primary['rank5']),
+        "mAP": float(primary['mAP']),
+        "mINP": float(primary['mINP']),
         "TAR@FAR=0.1%": float(tar_01) if not np.isnan(tar_01) else None,
-        "actual_FAR": float(actual_far) if not np.isnan(actual_far) else None,
+        "actual_FAR": float(actual_far) if not np.isnan(tar_01) else None,
         "threshold": float(t_star) if not np.isnan(tar_01) else None,
         "threshold_source": threshold_source,
+        "primary_space": primary_space,
+        "spaces": results,
     }
     with open(os.path.join(args.output_dir, "evaluation_report.json"), "w") as f:
         json.dump(report, f, indent=4)

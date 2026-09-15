@@ -216,6 +216,81 @@ def weights_init_classifier(m):
             nn.init.constant_(m.bias, 0.0)
 
 
+def load_checkpoint_verbose(model, checkpoint_path, tag="checkpoint", log=print):
+    """
+    Load checkpoint vào model, ĐỒNG THỜI báo cáo đầy đủ:
+      - missing        : key có trong model nhưng checkpoint không có → giữ init hiện tại
+      - unexpected     : key có trong checkpoint nhưng model không có → bị bỏ
+      - shape mismatch : key cùng tên nhưng khác shape → bị bỏ (trước đây lặng im)
+
+    Lý do: mọi chỗ load đều dùng `strict=False`, nghĩa là checkpoint thiếu key
+    (ví dụ TOÀN BỘ `backbone.*`) vẫn in ra "Loaded" như thành công. Nếu backbone
+    không được nạp, visual feature là feature pretrain chung chứ không phải feature
+    đã train → mọi kết luận eval/infer đều nhiễu.
+
+    Trả về dict summary để caller log/lưu.
+    """
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+    model_state = model.state_dict()
+
+    new_state_dict = {}
+    skipped_shape = []
+    for k, v in state_dict.items():
+        new_k = k[len('_orig_mod.'):] if k.startswith('_orig_mod.') else k
+        if new_k in model_state and tuple(v.shape) != tuple(model_state[new_k].shape):
+            skipped_shape.append((new_k, tuple(v.shape), tuple(model_state[new_k].shape)))
+            continue
+        new_state_dict[new_k] = v
+
+    missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
+
+    n_model = len(model_state)
+    n_loaded = sum(1 for k in model_state if k in new_state_dict)
+    backbone_missing = [k for k in missing if k.startswith('backbone.')]
+
+    log(f"  [{tag}] {os.path.basename(str(checkpoint_path))}: "
+        f"{n_loaded}/{n_model} keys của model được nạp "
+        f"({len(state_dict)} keys trong file)")
+
+    def _group(keys):
+        groups = {}
+        for k in keys:
+            groups.setdefault(k.split('.')[0], []).append(k)
+        return groups
+
+    if missing:
+        log(f"  [{tag}] ⚠️ MISSING {len(missing)} keys (giữ init hiện tại):")
+        for prefix, keys in sorted(_group(missing).items(), key=lambda kv: -len(kv[1])):
+            log(f"      - {prefix}.* : {len(keys)} keys (vd: {keys[0]})")
+    if unexpected:
+        log(f"  [{tag}] ⚠️ UNEXPECTED {len(unexpected)} keys trong checkpoint (bị bỏ):")
+        for prefix, keys in sorted(_group(unexpected).items(), key=lambda kv: -len(kv[1])):
+            log(f"      - {prefix}.* : {len(keys)} keys (vd: {keys[0]})")
+    if skipped_shape:
+        log(f"  [{tag}] ⚠️ SHAPE MISMATCH {len(skipped_shape)} keys (bị bỏ):")
+        for name, ck_shape, md_shape in skipped_shape[:10]:
+            log(f"      - {name}: checkpoint{ck_shape} vs model{md_shape}")
+
+    if backbone_missing:
+        log(f"  [{tag}] ❌ CẢNH BÁO NGHIÊM TRỌNG: {len(backbone_missing)} keys `backbone.*` "
+            f"KHÔNG được nạp từ checkpoint.")
+        log(f"      → Visual backbone đang chạy bằng init/pretrain, KHÔNG phải trọng số đã train.")
+        log(f"      → Kết quả eval/infer có thể nhiễu (visual feature không khớp temporal/head).")
+        log(f"      → Kiểm tra: checkpoint có chứa 'backbone.' không? Có lệch tên/shape không?")
+
+    return {
+        'tag': tag,
+        'path': str(checkpoint_path),
+        'n_model_keys': n_model,
+        'n_loaded_keys': n_loaded,
+        'missing': list(missing),
+        'unexpected': list(unexpected),
+        'skipped_shape': [s[0] for s in skipped_shape],
+        'backbone_missing': backbone_missing,
+    }
+
+
 class ReIDHead(nn.Module):
     """
     Classifer cho UAV ReID.

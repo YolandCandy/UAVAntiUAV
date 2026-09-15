@@ -11,7 +11,7 @@ import builtins
 from collections import namedtuple
 from torchvision import transforms
 
-from model import UAVReIDNet
+from model import UAVReIDNet, load_checkpoint_verbose
 
 def extract_cnn_feature(model, tensor_frame):
     with torch.no_grad():
@@ -263,7 +263,8 @@ class SeqReIDPipeline:
           temporal     : token Mamba                 — input head
           PRE-BN raw   : cat(visual_plain, temporal) — ĐẦU VÀO bnneck
           POST-BN fused: bnneck(...)                 — đầu ra bnneck = fine score
-        Cách đọc: raw cao (>=0.8) mà fused thấp (<=0.5) → BatchNorm1d là thủ phạm.
+        Cách đọc: raw cao (>=0.8) mà fused thấp hơn `reid_threshold` → bnneck là mắt xích đang
+                  chặn HARD LOCK (nhưng CHƯA nói được BN có hại hay không — cần TAR@FAR).
                   raw thấp sẵn (~ temporal)          → vấn đề nằm ở feature (temporal/dữ liệu train).
         """
         if not self.debug_sim:
@@ -577,9 +578,19 @@ def run_sequence(seq_dir, model, device, transform, cfg, inf_cfg, out_base=None)
     if pre_bn_mean >= 0 and post_bn_mean >= 0:
         n_pairs = len(pipeline.debug_pre_bn_scores)
         bn_delta = pre_bn_mean - post_bn_mean
-        verdict = ("BN LÀ thủ phạm (raw cao, fused thấp)" if pre_bn_mean >= 0.80 and post_bn_mean < 0.60
-                   else "BN KHÔNG phải thủ phạm (raw đã thấp sẵn → lỗi ở feature/temporal)"
-                   if pre_bn_mean < 0.70 else "Chưa kết luận rõ (raw và fused chênh không nhiều)")
+        thr = pipeline.reid_threshold
+        if pre_bn_mean < 0.70:
+            verdict = ("raw cũng thấp sẵn -> lỗi nằm ở feature (temporal/dữ liệu train), KHÔNG phải BN")
+        elif bn_delta < 0.05:
+            verdict = "BN gần như không ảnh hưởng cosine"
+        elif pre_bn_mean >= thr > post_bn_mean:
+            verdict = (f"BN nén cosine xuống dưới ngưỡng {thr:.2f} -> BN là mắt xích đang chặn HARD LOCK. "
+                       f"LƯU Ý: raw cao hơn KHÔNG chứng minh phân biệt tốt hơn (impostor cũng cao hơn); "
+                       f"cần TAR@FAR: calibrate_threshold.py rồi evaluate_reid.py --space pre_bn")
+        else:
+            side = "trên" if post_bn_mean >= thr else "dưới"
+            verdict = (f"BN nén cosine {bn_delta:.3f}, nhưng cả raw lẫn fused đều đang {side} ngưỡng {thr:.2f} "
+                       f"-> BN không phải nút thắt của sequence này")
         metrics_report.append(f"Sim PRE-BN  (raw concat)   : {pre_bn_mean:.3f} (n={n_pairs})")
         metrics_report.append(f"Sim POST-BN (fused/fine)   : {post_bn_mean:.3f}")
         metrics_report.append(f"BN degradation (pre - post) : {bn_delta:+.3f} -> {verdict}")
@@ -610,16 +621,10 @@ def main():
     model = UAVReIDNet(backbone=backbone_type)
     model_path = args.checkpoint or inf_cfg.get('model_path', './best_model.pth')
     if os.path.exists(model_path):
-        checkpoint = torch.load(model_path, map_location='cpu')
-        state_dict = checkpoint.get('model_state_dict', checkpoint)
-        new_state_dict = {}
-        model_state = model.state_dict()
-        for k, v in state_dict.items():
-            new_k = k.replace('_orig_mod.', '') if k.startswith('_orig_mod.') else k
-            if new_k in model_state and v.shape != model_state[new_k].shape:
-                continue
-            new_state_dict[new_k] = v
-        model.load_state_dict(new_state_dict, strict=False)
+        # 🛠️ (14/9): báo cáo đầy đủ missing/unexpected/shape-mismatch thay vì "Loaded" mù quáng.
+        # Cảnh báo nghiêm trọng nếu `backbone.*` không được nạp (visual branch chạy pretrain,
+        # trong khi temporal/head được train trên feature khác → mọi score đều đáng ngờ).
+        load_checkpoint_verbose(model, model_path, tag="infer")
         print("Model loaded successfully.")
     else:
         print(f"Warning: Checkpoint {model_path} not found. Running with random weights.")
