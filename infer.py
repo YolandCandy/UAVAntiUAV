@@ -196,6 +196,7 @@ def parse_args():
     parser.add_argument("--seq-dir", type=str, default=None)
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--config", type=str, default="configs/config_jetson.yaml")
+    parser.add_argument("--out-dir", type=str, default=None, help="Output directory")
     return parser.parse_args()
 
 def crop_and_pad(frame, bbox, padding):
@@ -656,7 +657,7 @@ def main():
         all_pre_bn = []
         all_post_bn = []
         
-        base_out_dir = inf_cfg.get('out_dir', './infer_output')
+        base_out_dir = args.out_dir or inf_cfg.get('out_dir', './infer_output')
         print(f"Batch processing: Results will be saved in base directory: {base_out_dir}")
         for sdir in valid_seqs:
             res = run_sequence(sdir, model, device, transform, cfg, inf_cfg, out_base=base_out_dir)
@@ -710,7 +711,7 @@ def main():
                 sf.write(line + "\n")
             
     else:
-        run_sequence(seq_dir_arg, model, device, transform, cfg, inf_cfg, out_base=None)
+        run_sequence(seq_dir_arg, model, device, transform, cfg, inf_cfg, out_base=args.out_dir)
 
 if __name__ == "__main__":
     main()
