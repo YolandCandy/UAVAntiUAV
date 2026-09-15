@@ -120,6 +120,8 @@ flowchart TD
 ## 2. TRỤC NÃO BỘ CHUYỂN ĐỘNG: TEMPORAL MAMBA
 Nhiệm vụ: Tìm kiếm quỹ đạo bay và mô hình chuyển động theo trục thời gian bằng công nghệ State Space Model (SSM).
 
+### 2.1. Cấu trúc Bi-Mamba (Tầm nhìn 2 chiều)
+
 ```mermaid
 flowchart TD
     classDef tensor fill:#e1bee7,stroke:#8e24aa,stroke-width:1px,color:#000
@@ -127,23 +129,156 @@ flowchart TD
     classDef split fill:#ffcc80,stroke:#f57c00,stroke-width:1px,color:#000
     classDef block fill:#c8e6c9,stroke:#388e3c,stroke-width:1px,color:#000
 
-    In("Input Mamba Layer<br>[1, 16, 512]"):::tensor --> Split["Tách 2 chiều"]:::split
-    
+    In("Input Mamba Layer<br>[1, 16, 512]"):::tensor
+    Split["Tách 2 chiều"]:::split
     Fwd["Chiều Xuôi<br>Lõi S6"]:::block
-    Flip1["Lật Video"]:::op --> Bwd["Chiều Ngược<br>Lõi S6"]:::block --> Flip2["Lật Lại"]:::op
-    
+    Flip1["Lật Video"]:::op
+    Bwd["Chiều Ngược<br>Lõi S6"]:::block
+    Flip2["Lật Lại"]:::op
+    Add["Element-wise Add"]:::split
+    Norm["LayerNorm"]:::op
+    Out("Output Mamba Layer<br>[1, 16, 512]"):::tensor
+
+    In --> Split
     Split --> Fwd
     Split --> Flip1
+    Flip1 --> Bwd
+    Bwd --> Flip2
     
-    Fwd & Flip2 & In --> Add["Element-wise Add"]:::split --> Norm["LayerNorm"]:::op
-    Norm --> Out("Output Mamba Layer<br>[1, 16, 512]"):::tensor
+    Fwd --> Add
+    Flip2 --> Add
+    In --> Add
+    
+    Add --> Norm
+    Norm --> Out
 ```
 
-**Giải phẫu chi tiết cơ chế Mamba:**
+**Giải phẫu chi tiết cơ chế Bi-Mamba:**
 *   **Linear Projection & Positional Embedding:** Nén vector khổng lồ `2560` xuống `512` chiều để giảm tải RAM, đồng thời cộng thêm ma trận số thứ tự (tọa độ thời gian) để Mamba phân biệt được trật tự trước/sau của các frame ảnh.
-*   **Lõi toán học S6 (Selective):** Không giống RNN truyền thống, Mamba lấy ma trận Đầu vào chạy qua lớp Linear để tự động sinh ra các ma trận quy tắc $\Delta, B, C$. Nhờ các quy tắc "chọn lọc" này, mạng biết đóng băng trí nhớ khi gặp frame rác, và mở to trí nhớ để nạp các frame chứa chuyển động UAV rõ rệt. Quá trình lặp được giải nhanh bằng thuật toán Parallel Scan trên GPU.
 *   **Phân tích Kép (Bidirectional):** Khi UAV bị che khuất ngang chừng (Occlusion), việc chỉ nhìn từ Quá khứ (Chiều xuôi) sẽ khiến mạng mất dấu. Bằng cách lấy thêm dữ liệu tua ngược từ Tương lai (Chiều ngược) và cộng gộp lại, mạng có khả năng **nội suy và vá lỗi quỹ đạo** cực kỳ mạnh mẽ.
-*   **Đầu ra:** Đi qua Temporal Mean Pooling và MLP Head để tạo ra **Temporal Token `[1, 512]`** sắc nét.
+
+### 2.2. Giải phẫu chi tiết Cấp độ Ma trận của khối SimpleS6Block (Selective Scan)
+Đây là lõi toán học thay thế hoàn hảo cho Attention, giúp Mamba xử lý tuyến tính mà vẫn "chọn lọc" được ngữ cảnh. Giả định đầu vào `x` có kích thước **`[B=1, L=16, d_model=512]`** (1 video, 16 frames, 512 chiều), hệ số mở rộng `expand=2`, bộ nhớ `d_state=16`.
+=> `d_inner = expand * d_model = 1024`.
+
+```mermaid
+flowchart TD
+    classDef tensor fill:#e1bee7,stroke:#8e24aa,stroke-width:1px,color:#000
+    classDef op fill:#bbdefb,stroke:#1976d2,stroke-width:1px,color:#000
+    classDef split fill:#ffcc80,stroke:#f57c00,stroke-width:1px,color:#000
+    classDef param fill:#fff9c4,stroke:#fbc02d,stroke-width:1px,color:#000
+
+    X("Input x<br>[1, 16, 512]"):::tensor
+    InProj["Linear in_proj"]:::op
+    XZ("XZ<br>[1, 16, 2048]"):::tensor
+    Chunk["Chunk (Chia đôi)"]:::split
+    
+    X_Proj("x_proj<br>[1, 16, 1024]"):::tensor
+    Z_Gate("z_gate<br>[1, 16, 1024]"):::tensor
+    
+    Conv1D["Conv1d (Depthwise)<br>SiLU"]:::op
+    X_Conv("x_conv (Feature)<br>[1, 16, 1024]"):::tensor
+    
+    X_Proj_Param["Linear x_proj"]:::op
+    XDbl("x_dbl<br>[1, 16, 33]"):::tensor
+    SplitParam["Tách tham số SSM"]:::split
+    
+    DT_raw("dt_raw<br>[1, 16, 1]"):::tensor
+    B_mat("B_mat<br>[1, 16, 16]"):::tensor
+    C_mat("C_mat<br>[1, 16, 16]"):::tensor
+    
+    DTProj["Linear dt_proj<br>Softplus"]:::op
+    DT("dt (Thời gian bù)<br>[1, 16, 1024]"):::tensor
+    
+    A_Log("A_log Parameter<br>[1024, 16]"):::param
+    A_Exp["-exp(A)"]:::op
+    A_mat("A_mat<br>[1024, 16]"):::tensor
+
+    X --> InProj --> XZ --> Chunk
+    Chunk --> X_Proj
+    Chunk --> Z_Gate
+    
+    X_Proj --> Conv1D --> X_Conv
+    X_Conv --> X_Proj_Param --> XDbl --> SplitParam
+    
+    SplitParam --> DT_raw
+    SplitParam --> B_mat
+    SplitParam --> C_mat
+    
+    DT_raw --> DTProj --> DT
+    A_Log --> A_Exp --> A_mat
+    
+    subgraph Parallel_Selective_Scan ["Thuật toán Parallel Scan"]
+        direction TB
+        MulW["W = dt * A"]:::op
+        W("W<br>[1, 16, 1024, 16]"):::tensor
+        MulV["V = (dt * B) * x_conv"]:::op
+        V("V<br>[1, 16, 1024, 16]"):::tensor
+        
+        Cumsum["Cumsum theo L<br>Tránh NaN bằng P_i - P_j"]:::op
+        P("Ma trận P<br>[1, 1024, 16, 16]"):::tensor
+        AttnForm["Nhân Trọng số (Attention-like)"]:::op
+        H("Trạng thái h<br>[1, 16, 1024, 16]"):::tensor
+
+        DT --> MulW
+        A_mat --> MulW
+        MulW --> W
+        
+        DT --> MulV
+        B_mat --> MulV
+        X_Conv --> MulV
+        MulV --> V
+        
+        W --> Cumsum --> P
+        P --> AttnForm
+        V --> AttnForm
+        AttnForm --> H
+    end
+    
+    Y_sum["Output: sum(h * C)"]:::op
+    Y_out("y<br>[1, 16, 1024]"):::tensor
+    SkipD["Cộng Skip Connection (D)"]:::op
+    Y_final("y_final<br>[1, 16, 1024]"):::tensor
+    Gate["Gating: y * SiLU(z_gate)"]:::op
+    Y_gated("y_gated<br>[1, 16, 1024]"):::tensor
+    OutProj["Linear out_proj"]:::op
+    FinalOut("Output S6 Block<br>[1, 16, 512]"):::tensor
+
+    H --> Y_sum
+    C_mat --> Y_sum
+    Y_sum --> Y_out
+    
+    Y_out --> SkipD
+    X_Conv --> SkipD
+    SkipD --> Y_final
+    
+    Y_final --> Gate
+    Z_Gate --> Gate
+    Gate --> Y_gated
+    Y_gated --> OutProj --> FinalOut
+```
+
+**Biến đổi Ma trận chi tiết trong SimpleS6Block:**
+
+*   **Bước 1: Mở rộng và Khởi tạo cục bộ (Linear & Local Conv)**
+    *   Ma trận đầu vào `[1, 16, 512]` được nhân ma trận (Linear) bung ra thành `[1, 16, 2048]`, sau đó cắt làm 2 nửa độc lập: Nhánh đặc trưng `x_proj` `[1, 16, 1024]` và Nhánh cổng kiểm soát `z_gate` `[1, 16, 1024]`.
+    *   `x_proj` đi qua tích chập 1D (Depthwise) để thu thập thông tin cục bộ giữa các frames lân cận, tạo ra `x_conv` **`[1, 16, 1024]`**.
+*   **Bước 2: Sinh tham số động "Selective" (Tính chọn lọc)**
+    *   Sự khác biệt lớn nhất giữa Mamba và SSM cũ là tham số không cố định. `x_conv` đi qua Linear để đẻ ra một ma trận siêu nhỏ `x_dbl` `[1, 16, 33]`.
+    *   `33` chiều này được cắt nhỏ thành: `dt` (1 chiều), `B` (16 chiều, tức `d_state`), `C` (16 chiều). Do đó, $B$ và $C$ biến đổi linh hoạt theo từng Frame.
+    *   Hệ số `dt` (bước nhảy thời gian) sau đó được giãn nở trở lại bằng Linear để phủ kín 1024 kênh $\rightarrow$ `dt` **`[1, 16, 1024]`**.
+*   **Bước 3: Parallel Selective Scan (Attention-like Formulation)**
+    *   Đây là phép thuật toán học của Mamba. Thay vì vòng lặp tuần tự $h_t = A * h_{t-1} + B * x_t$ rất chậm, đoạn code tính toán song song:
+    *   Biến rời rạc hóa: `W = dt * A` và trọng số `V = (dt * B) * x_conv`. Chúng tạo ra các ma trận 4D khổng lồ lưu trữ toàn bộ trạng thái hệ thống: **`[1, 16, 1024, 16]`** (Batch, L, d_inner, d_state).
+    *   Thuật toán tính toán ma trận tổng tích lũy (Cumsum) $P$ dọc theo chiều thời gian (L), sau đó lấy độ chênh lệch $(P_i - P_j)$. Trick toán học này để mô phỏng sự tích lũy của chuỗi thời gian mà không cần chạy vòng lặp, đồng thời tránh lỗi toán học NaN cực tốt.
+    *   Áp dụng Causal Mask (Mặt nạ tam giác dưới) để đảm bảo Tương lai không ảnh hưởng đến Quá khứ.
+    *   Hội tụ lại thu được bộ nhớ ẩn $h$ **`[1, 16, 1024, 16]`**.
+*   **Bước 4: Hội tụ Đầu ra & Gating**
+    *   Trạng thái $h$ nhân với hệ số quyết định $C$ rồi tính tổng (sum) dọc theo chiều `d_state` để nén lại thành `y` **`[1, 16, 1024]`**.
+    *   Cơ chế Gating: `y` được nhân phần tử (element-wise) với `SiLU(z_gate)`. Nhánh Gating đóng vai trò như một bộ lọc nhiễu, dập tắt các tín hiệu nhiễu từ bối cảnh và giữ lại luồng thông tin chứa quỹ đạo UAV.
+    *   Cuối cùng, chiếu tuyến tính (Linear out_proj) đưa ma trận về hình dáng ban đầu: **`[1, 16, 512]`**.
+
+*   **Đầu ra Cấp cao (Về lại TemporalMambaEncoder):** Ma trận `[1, 16, 512]` của Mamba Layer sau đó đi qua Temporal Mean Pooling (Lấy trung bình theo 16 frames) và mạng MLP Head để hội tụ về dạng token định danh thuần túy **`[1, 512]`**.
 
 ---
 

@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import builtins
+from collections import namedtuple
 from torchvision import transforms
 
 from model import UAVReIDNet
@@ -79,6 +80,19 @@ class SlidingWindowBuffer:
         self.sharpness_scores.clear()
         self._frame_counter = 0
 
+# 🛠️ DEBUG (14/9): bundle trả về đủ mọi tầng của phép fusion để đo được
+# cosine TRƯỚC BatchNorm (raw_feat) vs SAU BatchNorm (fused_feat).
+#   visual_mean    : weighted mean theo sharpness — chỉ dùng cho coarse score
+#   visual_plain   : plain mean — đúng như lúc train, là input của head
+#   temporal_token : đầu ra Mamba
+#   raw_feat       : L2-normalize( cat(visual_plain, temporal_token) )  ← TRƯỚC bnneck
+#   fused_feat     : L2-normalize( bnneck(cat(...)) )                   ← SAU bnneck (fine score)
+FusedBundle = namedtuple(
+    'FusedBundle',
+    ['visual_mean', 'visual_plain', 'temporal_token', 'raw_feat', 'fused_feat']
+)
+
+
 def compute_fused_vector(model, sliding_window):
     seq_feats = sliding_window.get_sequence()
     
@@ -95,10 +109,14 @@ def compute_fused_vector(model, sliding_window):
     # Tính temporal_token + fused_feat MỘT LẦN (không gọi temporal_encoder 2 lần)
     with torch.no_grad():
         temporal_token, _ = model.temporal_encoder(seq_feats)
+        # Đầu vào THÔ của head (trước bnneck) — chính là vector bị BatchNorm1d biến đổi
+        feat = torch.cat([visual_plain, temporal_token], dim=-1)
+        raw_feat = F.normalize(feat, p=2, dim=1)
+        
         bn_feat = model.head(visual_plain, temporal_token)
         fused_feat = F.normalize(bn_feat, p=2, dim=1)
     
-    return visual_mean, temporal_token, fused_feat
+    return FusedBundle(visual_mean, visual_plain, temporal_token, raw_feat, fused_feat)
 
 class TwoTierMemoryBank:
     def __init__(self, max_anchor: int = 10, max_recent: int = 30):
@@ -107,48 +125,65 @@ class TwoTierMemoryBank:
         self.anchor_bank = []
         self.recent_bank = []
     
-    def add_anchor(self, visual_feat: torch.Tensor, fused_feat: torch.Tensor, temporal_token: torch.Tensor = None):
-        if len(self.anchor_bank) < self.max_anchor:
-            self.anchor_bank.append({
-                "visual": F.normalize(visual_feat, p=2, dim=1),
-                "fused": F.normalize(fused_feat, p=2, dim=1),
-                "temporal": F.normalize(temporal_token, p=2, dim=1) if temporal_token is not None else None
-            })
+    @staticmethod
+    def _make_entry(visual_feat, fused_feat, temporal_token=None,
+                    visual_plain=None, raw_feat=None):
+        """Lưu đủ 5 tầng vector để debug: coarse(weighted) / plain / temporal / PRE-BN / POST-BN."""
+        def _norm(t):
+            return F.normalize(t, p=2, dim=1) if t is not None else None
+        return {
+            "visual": _norm(visual_feat),
+            "visual_plain": _norm(visual_plain),
+            "fused": _norm(fused_feat),
+            "raw": _norm(raw_feat),
+            "temporal": _norm(temporal_token),
+        }
     
-    def add_recent(self, visual_feat: torch.Tensor, fused_feat: torch.Tensor, temporal_token: torch.Tensor = None):
-        self.recent_bank.append({
-            "visual": F.normalize(visual_feat, p=2, dim=1),
-            "fused": F.normalize(fused_feat, p=2, dim=1),
-            "temporal": F.normalize(temporal_token, p=2, dim=1) if temporal_token is not None else None
-        })
+    def add_anchor(self, visual_feat: torch.Tensor, fused_feat: torch.Tensor,
+                   temporal_token: torch.Tensor = None, visual_plain: torch.Tensor = None,
+                   raw_feat: torch.Tensor = None):
+        if len(self.anchor_bank) < self.max_anchor:
+            self.anchor_bank.append(self._make_entry(
+                visual_feat, fused_feat, temporal_token, visual_plain, raw_feat))
+    
+    def add_recent(self, visual_feat: torch.Tensor, fused_feat: torch.Tensor,
+                   temporal_token: torch.Tensor = None, visual_plain: torch.Tensor = None,
+                   raw_feat: torch.Tensor = None):
+        self.recent_bank.append(self._make_entry(
+            visual_feat, fused_feat, temporal_token, visual_plain, raw_feat))
         if len(self.recent_bank) > self.max_recent:
             self.recent_bank.pop(0)
     
-    def coarse_score(self, query_feat: torch.Tensor) -> float:
+    def _max_sim(self, query_feat: torch.Tensor, key: str) -> float:
+        """Cosine similarity lớn nhất giữa query và mọi entry có trường `key`."""
         query = F.normalize(query_feat, p=2, dim=1)
         max_sim = 0.0
         for entry in self.anchor_bank + self.recent_bank:
-            sim = torch.mm(query, entry["visual"].t()).item()
-            max_sim = max(max_sim, sim)
-        return max_sim
-    
-    # DEBUG: so sánh riêng temporal token với anchor
-    def temporal_score(self, query_temporal: torch.Tensor) -> float:
-        query = F.normalize(query_temporal, p=2, dim=1)
-        max_sim = 0.0
-        for entry in self.anchor_bank + self.recent_bank:
-            if entry["temporal"] is not None:
-                sim = torch.mm(query, entry["temporal"].t()).item()
+            ref = entry.get(key)
+            if ref is not None:
+                sim = torch.mm(query, ref.t()).item()
                 max_sim = max(max_sim, sim)
         return max_sim
     
+    def coarse_score(self, query_feat: torch.Tensor) -> float:
+        """Coarse: visual weighted-mean (KHÔNG qua head)."""
+        return self._max_sim(query_feat, "visual")
+    
+    # DEBUG: so sánh riêng visual_plain (đúng input của head) với anchor
+    def visual_plain_score(self, query_visual_plain: torch.Tensor) -> float:
+        return self._max_sim(query_visual_plain, "visual_plain")
+    
+    # DEBUG: so sánh riêng temporal token với anchor
+    def temporal_score(self, query_temporal: torch.Tensor) -> float:
+        return self._max_sim(query_temporal, "temporal")
+    
+    # DEBUG: cosine TRƯỚC BatchNorm1d (cat thô đã L2-normalize)
+    def raw_score(self, query_raw: torch.Tensor) -> float:
+        return self._max_sim(query_raw, "raw")
+    
+    # Fine: cosine SAU BatchNorm1d — đây là score pipeline đang dùng để HARD LOCK
     def fine_score(self, query_fused: torch.Tensor) -> float:
-        query = F.normalize(query_fused, p=2, dim=1)
-        max_sim = 0.0
-        for entry in self.anchor_bank + self.recent_bank:
-            sim = torch.mm(query, entry["fused"].t()).item()
-            max_sim = max(max_sim, sim)
-        return max_sim
+        return self._max_sim(query_fused, "fused")
     
     def is_empty(self) -> bool:
         return len(self.anchor_bank) == 0 and len(self.recent_bank) == 0
@@ -196,6 +231,9 @@ class SeqReIDPipeline:
         self.hijack_check_count = cfg.get('hijack_check_count', 5)
         self.update_interval_sec = cfg.get('update_interval_sec', 2.0)
         self.bbox_padding = cfg.get('bbox_padding', 0.2)
+        # 🛠️ DEBUG (14/9): in tách cosine TRƯỚC BN (raw) vs SAU BN (fused).
+        # Bật/tắt bằng `debug_sim` trong block `infer` của config.
+        self.debug_sim = cfg.get('debug_sim', True)
         
         self.memory_bank = TwoTierMemoryBank(
             max_anchor=cfg.get('max_anchor_size', 10),
@@ -212,6 +250,32 @@ class SeqReIDPipeline:
         self.false_alarms = 0
         self.reid_latency_frames = []
         self.reappeared_frame_idx = -1
+        # Tích luỹ để tổng hợp cuối sequence (trả lời câu hỏi: BN có phá cosine không?)
+        self.debug_pre_bn_scores = []
+        self.debug_post_bn_scores = []
+        
+    def _log_sim_breakdown(self, frame_idx, bundle, fused_score, tag="sim"):
+        """
+        In breakdown cosine của cùng một truy vấn (cùng cửa sổ) với Memory Bank:
+          visual_shot  : weighted mean (coarse)      — ngoài head
+          visual_plain : plain mean (input head)     — ngoài head
+          temporal     : token Mamba                 — input head
+          PRE-BN raw   : cat(visual_plain, temporal) — ĐẦU VÀO bnneck
+          POST-BN fused: bnneck(...)                 — đầu ra bnneck = fine score
+        Cách đọc: raw cao (>=0.8) mà fused thấp (<=0.5) → BatchNorm1d là thủ phạm.
+                  raw thấp sẵn (~ temporal)          → vấn đề nằm ở feature (temporal/dữ liệu train).
+        """
+        if not self.debug_sim:
+            return
+        vis = self.memory_bank.coarse_score(bundle.visual_mean)
+        vis_plain = self.memory_bank.visual_plain_score(bundle.visual_plain)
+        temp = self.memory_bank.temporal_score(bundle.temporal_token)
+        raw = self.memory_bank.raw_score(bundle.raw_feat)
+        self.debug_pre_bn_scores.append(raw)
+        self.debug_post_bn_scores.append(fused_score)
+        print(f"[{frame_idx}] DEBUG {tag}: visual_shot={vis:.3f} | visual_plain={vis_plain:.3f} | "
+              f"temporal={temp:.3f} || PRE-BN raw={raw:.3f} -> POST-BN fused={fused_score:.3f} "
+              f"(BN delta={raw - fused_score:+.3f})")
         
     def _transition_to_lost(self, frame_idx):
         print(f"[{frame_idx}] Target LOST! -> T1_LOST")
@@ -232,13 +296,15 @@ class SeqReIDPipeline:
                         
                     if self.device.type == 'cuda': torch.cuda.synchronize()
                     t0 = time.time()
-                    visual_mean, temporal_token, fused_feat = compute_fused_vector(self.model, self.sliding_window)
+                    bundle = compute_fused_vector(self.model, self.sliding_window)
                     if self.device.type == 'cuda': torch.cuda.synchronize()
                     self.metrics_mamba_times.append((time.time() - t0) * 1000)
                     if len(self.memory_bank.anchor_bank) < self.memory_bank.max_anchor:
-                        self.memory_bank.add_anchor(visual_mean, fused_feat, temporal_token)
+                        self.memory_bank.add_anchor(bundle.visual_mean, bundle.fused_feat, bundle.temporal_token,
+                                                    bundle.visual_plain, bundle.raw_feat)
                     else:
-                        self.memory_bank.add_recent(visual_mean, fused_feat, temporal_token)
+                        self.memory_bank.add_recent(bundle.visual_mean, bundle.fused_feat, bundle.temporal_token,
+                                                    bundle.visual_plain, bundle.raw_feat)
                     print(f"[{frame_idx}] Last-moment Memory Bank update before LOST. Bank: {self.memory_bank.size_info()}")
                 self._transition_to_lost(frame_idx)
                 return
@@ -258,25 +324,28 @@ class SeqReIDPipeline:
             if self.sliding_window.is_ready() and time_elapsed >= self.update_interval_sec:
                 if self.device.type == 'cuda': torch.cuda.synchronize()
                 t0 = time.time()
-                visual_mean, temporal_token, fused_feat = compute_fused_vector(self.model, self.sliding_window)
+                bundle = compute_fused_vector(self.model, self.sliding_window)
                 if self.device.type == 'cuda': torch.cuda.synchronize()
                 self.metrics_mamba_times.append((time.time() - t0) * 1000)
                 
                 # Anti-Hijack: so sánh với bank CŨ trước khi thêm vector hiện tại vào bank
                 if self.state == self.T3_VERIFIED and self._hijack_checks_remaining > 0:
-                    hijack_score = self.memory_bank.fine_score(fused_feat)
+                    hijack_score = self.memory_bank.fine_score(bundle.fused_feat)
                     self._hijack_checks_remaining -= 1
                     print(f"[{frame_idx}] Anti-Hijack check #{self.hijack_check_count - self._hijack_checks_remaining}: score={hijack_score:.3f}")
+                    self._log_sim_breakdown(frame_idx, bundle, hijack_score, tag="anti-hijack")
                     if hijack_score < self.hijack_threshold:
                         print(f"[{frame_idx}] WARNING: HIJACK DETECTED! -> T1_LOST")
                         self._transition_to_lost(frame_idx)
                         return
                 
                 if len(self.memory_bank.anchor_bank) < self.memory_bank.max_anchor:
-                    self.memory_bank.add_anchor(visual_mean, fused_feat, temporal_token)
+                    self.memory_bank.add_anchor(bundle.visual_mean, bundle.fused_feat, bundle.temporal_token,
+                                                bundle.visual_plain, bundle.raw_feat)
                     print(f"[{frame_idx}] Anchor updated. {self.memory_bank.size_info()}")
                 else:
-                    self.memory_bank.add_recent(visual_mean, fused_feat, temporal_token)
+                    self.memory_bank.add_recent(bundle.visual_mean, bundle.fused_feat, bundle.temporal_token,
+                                                bundle.visual_plain, bundle.raw_feat)
                     print(f"[{frame_idx}] Recent updated. {self.memory_bank.size_info()}")
                 
                 self.last_update_time = current_time
@@ -324,7 +393,7 @@ class SeqReIDPipeline:
                 if self.soft_lock_buffer.is_ready():
                     if self.device.type == 'cuda': torch.cuda.synchronize()
                     t0 = time.time()
-                    visual_mean, temporal_token, fused_feat = compute_fused_vector(self.model, self.soft_lock_buffer)
+                    bundle = compute_fused_vector(self.model, self.soft_lock_buffer)
                     if self.device.type == 'cuda': torch.cuda.synchronize()
                     mamba_time = (time.time() - t0) * 1000
                     self.metrics_mamba_times.append(mamba_time)
@@ -332,12 +401,9 @@ class SeqReIDPipeline:
                     if self.memory_bank.is_empty():
                         fine_score = 1.0
                     else:
-                        fine_score = self.memory_bank.fine_score(fused_feat)
-                        # 🛠️ DEBUG: tách riêng visual_mean vs temporal_token để biết phần nào gây lệch
-                        debug_vis = self.memory_bank.coarse_score(visual_mean)
-                        debug_temp = self.memory_bank.temporal_score(temporal_token)
-                        debug_fused = fine_score
-                        print(f"[{frame_idx}] DEBUG sim: visual_mean={debug_vis:.3f} | temporal={debug_temp:.3f} | fused(fine)={debug_fused:.3f}")
+                        fine_score = self.memory_bank.fine_score(bundle.fused_feat)
+                        # 🛠️ DEBUG (14/9): breakdown đầy đủ, đặc biệt là PRE-BN raw vs POST-BN fused
+                        self._log_sim_breakdown(frame_idx, bundle, fine_score, tag="re-acquire")
                     if fine_score >= self.reid_threshold:
                         latency = frame_idx - self.reappeared_frame_idx
                         self.reid_latency_frames.append(latency)
@@ -347,9 +413,11 @@ class SeqReIDPipeline:
                         self.last_update_time = time.time()
                         
                         if len(self.memory_bank.anchor_bank) < self.memory_bank.max_anchor:
-                            self.memory_bank.add_anchor(visual_mean, fused_feat, temporal_token)
+                            self.memory_bank.add_anchor(bundle.visual_mean, bundle.fused_feat, bundle.temporal_token,
+                                                        bundle.visual_plain, bundle.raw_feat)
                         else:
-                            self.memory_bank.add_recent(visual_mean, fused_feat, temporal_token)
+                            self.memory_bank.add_recent(bundle.visual_mean, bundle.fused_feat, bundle.temporal_token,
+                                                        bundle.visual_plain, bundle.raw_feat)
                             
                         self.sliding_window = self.soft_lock_buffer
                         self.sliding_window.stride = self.stride
@@ -501,12 +569,27 @@ def run_sequence(seq_dir, model, device, transform, cfg, inf_cfg, out_base=None)
         
     metrics_report.append(f"False Alarms (Fine Fails)  : {pipeline.false_alarms}")
     
+    # 🛠️ DEBUG (14/9): tổng hợp PRE-BN vs POST-BN để trả lời dứt khoát câu hỏi
+    # "BatchNorm1d trong ReIDHead có phá cosine similarity không?"
+    pre_bn_mean = float(np.mean(pipeline.debug_pre_bn_scores)) if pipeline.debug_pre_bn_scores else -1.0
+    post_bn_mean = float(np.mean(pipeline.debug_post_bn_scores)) if pipeline.debug_post_bn_scores else -1.0
+    if pre_bn_mean >= 0 and post_bn_mean >= 0:
+        n_pairs = len(pipeline.debug_pre_bn_scores)
+        bn_delta = pre_bn_mean - post_bn_mean
+        verdict = ("BN LÀ thủ phạm (raw cao, fused thấp)" if pre_bn_mean >= 0.80 and post_bn_mean < 0.60
+                   else "BN KHÔNG phải thủ phạm (raw đã thấp sẵn → lỗi ở feature/temporal)"
+                   if pre_bn_mean < 0.70 else "Chưa kết luận rõ (raw và fused chênh không nhiều)")
+        metrics_report.append(f"Sim PRE-BN  (raw concat)   : {pre_bn_mean:.3f} (n={n_pairs})")
+        metrics_report.append(f"Sim POST-BN (fused/fine)   : {post_bn_mean:.3f}")
+        metrics_report.append(f"BN degradation (pre - post) : {bn_delta:+.3f} -> {verdict}")
+    
     print("\n".join(metrics_report))
     metrics_file.close()
     builtins.print = _orig_print
     
     mean_latency = np.mean(pipeline.reid_latency_frames) if pipeline.reid_latency_frames else -1.0
-    return avg_cnn, avg_mamba, throughput, mean_latency, pipeline.false_alarms
+    return (avg_cnn, avg_mamba, throughput, mean_latency, pipeline.false_alarms,
+            pipeline.debug_pre_bn_scores, pipeline.debug_post_bn_scores)
 
 def main():
     args = parse_args()
@@ -570,19 +653,23 @@ def main():
         all_throughput = []
         all_latency = []
         all_false_alarms = []
+        all_pre_bn = []
+        all_post_bn = []
         
         base_out_dir = inf_cfg.get('out_dir', './infer_output')
         print(f"Batch processing: Results will be saved in base directory: {base_out_dir}")
         for sdir in valid_seqs:
             res = run_sequence(sdir, model, device, transform, cfg, inf_cfg, out_base=base_out_dir)
             if res:
-                c, m, t, l, f = res
+                c, m, t, l, f, pre_bn, post_bn = res
                 all_cnn.append(c)
                 all_mamba.append(m)
                 all_throughput.append(t)
                 if l >= 0:
                     all_latency.append(l)
                 all_false_alarms.append(f)
+                all_pre_bn.extend(pre_bn)
+                all_post_bn.extend(post_bn)
                 
         # Calculate averages
         avg_cnn = np.mean(all_cnn) if all_cnn else 0.0
@@ -591,12 +678,24 @@ def main():
         avg_latency = np.mean(all_latency) if all_latency else 0.0
         sum_false_alarms = int(np.sum(all_false_alarms)) if all_false_alarms else 0
         
+        pre_bn_mean = float(np.mean(all_pre_bn)) if all_pre_bn else -1.0
+        post_bn_mean = float(np.mean(all_post_bn)) if all_post_bn else -1.0
+        bn_lines = []
+        if pre_bn_mean >= 0 and post_bn_mean >= 0:
+            bn_lines = [
+                f"Sim PRE-BN  (raw concat)   : {pre_bn_mean:.3f} (n={len(all_pre_bn)})",
+                f"Sim POST-BN (fused/fine)   : {post_bn_mean:.3f}",
+                f"BN degradation (pre - post) : {pre_bn_mean - post_bn_mean:+.3f}",
+            ]
+        
         print("\n=== AGGREGATED METRICS ===")
         print(f"Avg CNN Feature Extraction : {avg_cnn:.2f} ms")
         print(f"Avg System Throughput      : {avg_throughput:.2f} FPS")
         print(f"Avg Mamba + Head Time      : {avg_mamba:.2f} ms")
         print(f"Avg Re-acquisition Latency : {avg_latency:.2f} frames")
         print(f"Total False Alarms         : {sum_false_alarms}")
+        for line in bn_lines:
+            print(line)
         
         # Save to summary text file
         os.makedirs(base_out_dir, exist_ok=True)
@@ -607,6 +706,8 @@ def main():
             sf.write(f"Avg Mamba + Head Time      : {avg_mamba:.2f} ms\n")
             sf.write(f"Avg Re-acquisition Latency : {avg_latency:.2f} frames\n")
             sf.write(f"Total False Alarms         : {sum_false_alarms}\n")
+            for line in bn_lines:
+                sf.write(line + "\n")
             
     else:
         run_sequence(seq_dir_arg, model, device, transform, cfg, inf_cfg, out_base=None)

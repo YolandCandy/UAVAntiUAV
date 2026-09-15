@@ -99,7 +99,11 @@ infer:
   output_video: output_reid.mp4
   out_dir: ./infer_output/infer_pipeline_3.5
   stride: 2
-  num_frames: 8
+  # 🛠️ FIX (14/9): PHẢI khớp `train.num_frames` ở trên (đang = 12).
+  # Trước đây = 8 → Mamba + mean-pooling chạy trên 8 token trong khi lúc train là 12
+  # → phân phối temporal token lệch sẵn, rồi bnneck khuếch đại → fine score tụt.
+  # (Cửa sổ 12 token × stride 2 ≈ phủ 24 frame thô, tương đương 12 frame sample lúc train.)
+  num_frames: 12
   bbox_padding: 0.2
   max_anchor_size: 5
   max_recent_size: 15
@@ -108,6 +112,9 @@ infer:
   hijack_threshold: 0.40
   hijack_check_count: 5
   update_interval_sec: 2.0
+  # 🛠️ DEBUG (14/9): in cosine TRƯỚC bnneck (raw concat) vs SAU bnneck (fused).
+  # Đặt false để tắt khi không cần chẩn đoán.
+  debug_sim: true
 
 # --- Inference Robustness Test ---
 infer_robustness:
