@@ -724,26 +724,19 @@ class DINOv3ConvNeXtBackbone(nn.Module):
                 full_model = AutoModel.from_pretrained(model_name, **kwargs)
             except Exception as e:
                 print(f"⚠️ Không thể tải pretrain từ HuggingFace ({e}). Khởi tạo cấu trúc ConvNeXt-Small offline...")
-                pretrained = False
+                full_model = None
 
-        if not pretrained or full_model is None:
-            try:
-                if hf_token:
-                    config = AutoConfig.from_pretrained(model_name, **kwargs)
-                    full_model = AutoModel.from_config(config)
-                else:
-                    raise ValueError("No HF token provided, creating ConvNeXt-Small config locally")
-            except Exception:
-                from transformers import ConvNextConfig, ConvNextModel
-                # Cấu trúc ConvNeXt-Small chuẩn: depths=[3, 3, 27, 3], hidden_sizes=[96, 192, 384, 768]
-                config = ConvNextConfig(
-                    depths=[3, 3, 27, 3],
-                    hidden_sizes=[96, 192, 384, 768],
-                    patch_size=4,
-                    num_channels=3,
-                )
-                full_model = ConvNextModel(config)
-                print("  Đã tạo cấu trúc ConvNeXt-Small hoàn toàn offline (chuẩn bị nạp weights từ checkpoint).")
+        if full_model is None:
+            from transformers import ConvNextConfig, ConvNextModel
+            # Cấu trúc ConvNeXt-Small chuẩn: depths=[3, 3, 27, 3], hidden_sizes=[96, 192, 384, 768]
+            config = ConvNextConfig(
+                depths=[3, 3, 27, 3],
+                hidden_sizes=[96, 192, 384, 768],
+                patch_size=4,
+                num_channels=3,
+            )
+            full_model = ConvNextModel(config)
+            print("  Đã tạo cấu trúc ConvNeXt-Small hoàn toàn offline (chuẩn bị nạp weights từ checkpoint).")
 
         # Split model into individual stages for sequential execution
         if hasattr(full_model, "embeddings"):
