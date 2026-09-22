@@ -238,6 +238,20 @@ def load_checkpoint_verbose(model, checkpoint_path, tag="checkpoint", log=print)
     skipped_shape = []
     for k, v in state_dict.items():
         new_k = k[len('_orig_mod.'):] if k.startswith('_orig_mod.') else k
+
+        # Tự động ánh xạ (remap) giữa định dạng DINOv3 ConvNeXt và ConvNextModel chuẩn
+        if new_k not in model_state:
+            alt_k = new_k
+            if ".stage1.downsample_layers.0." in alt_k:
+                alt_k = alt_k.replace(".stage1.downsample_layers.0.", ".stem.patch_embeddings.")
+            elif ".stage1.downsample_layers.1." in alt_k:
+                alt_k = alt_k.replace(".stage1.downsample_layers.1.", ".stem.layernorm.")
+            elif ".downsample_layers." in alt_k:
+                alt_k = alt_k.replace(".downsample_layers.", ".downsampling_layer.")
+            
+            if alt_k in model_state and tuple(v.shape) == tuple(model_state[alt_k].shape):
+                new_k = alt_k
+
         if new_k in model_state and tuple(v.shape) != tuple(model_state[new_k].shape):
             skipped_shape.append((new_k, tuple(v.shape), tuple(model_state[new_k].shape)))
             continue
@@ -319,7 +333,7 @@ class ReIDHead(nn.Module):
 
 
 class UAVReIDNet(nn.Module):
-    def __init__(self, gasnet_weights_path=None, num_identities=1000, freeze_backbone=True, backbone='resnet50_ibn', pretrained=False):
+    def __init__(self, gasnet_weights_path=None, num_identities=502, freeze_backbone=True, backbone='resnet50_ibn', pretrained=False):
         super().__init__()
         
         # Tự động trỏ path mặc định nếu không truyền
