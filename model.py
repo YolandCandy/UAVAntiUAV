@@ -261,15 +261,25 @@ def load_checkpoint_verbose(model, checkpoint_path, tag="checkpoint", log=print)
                 c2 = c2[:-len(".layer_scale_parameter")] + ".gamma"
             candidates.append(c2)
             
-            # Quy tắc 3: Norm & Convs
+            # Quy tắc 3: Conv & Norm mapping (hỗ trợ cả 2 chiều: depthwise_conv <-> dwconv, pointwise_conv <-> pwconv, layer_norm/norm <-> layernorm)
             for base_c in [c1, c2]:
-                candidates.append(base_c.replace(".norm.", ".layernorm."))
-                candidates.append(base_c.replace(".norm.", ".layer_norm."))
-                candidates.append(base_c.replace(".layernorm.", ".norm."))
-                candidates.append(base_c.replace(".dwconv.", ".depthwise_conv."))
-                candidates.append(base_c.replace(".pwconv1.", ".pointwise_conv1."))
-                candidates.append(base_c.replace(".pwconv2.", ".pointwise_conv2."))
-                candidates.append(base_c.replace(".norm.", ".layernorm.").replace(".dwconv.", ".depthwise_conv."))
+                # Chiều checkpoint DINOv3 -> Model ConvNeXt (depthwise_conv -> dwconv, pointwise_conv -> pwconv)
+                mapped = base_c
+                mapped = mapped.replace(".depthwise_conv.", ".dwconv.")
+                mapped = mapped.replace(".pointwise_conv1.", ".pwconv1.")
+                mapped = mapped.replace(".pointwise_conv2.", ".pwconv2.")
+                mapped = mapped.replace(".pointwise_conv.", ".pwconv.")
+                mapped = mapped.replace(".layer_norm.", ".layernorm.")
+                mapped = mapped.replace(".norm.", ".layernorm.")
+                candidates.append(mapped)
+
+                # Chiều ngược lại
+                rev = base_c
+                rev = rev.replace(".dwconv.", ".depthwise_conv.")
+                rev = rev.replace(".pwconv1.", ".pointwise_conv1.")
+                rev = rev.replace(".pwconv2.", ".pointwise_conv2.")
+                rev = rev.replace(".layernorm.", ".layer_norm.")
+                candidates.append(rev)
 
             for cand in candidates:
                 if cand in model_state and tuple(v.shape) == tuple(model_state[cand].shape):
