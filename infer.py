@@ -494,16 +494,44 @@ def run_sequence(seq_dir, model, device, transform, cfg, inf_cfg, out_base=None)
     if os.path.exists(absent_path):
         with open(absent_path, "r") as f:
             absent = [int(line.strip()) for line in f if line.strip().isdigit()]
-    if not os.path.exists(video_path):
-        print(f"Error: {video_path} not found.")
+    # Hỗ trợ cả file video .mp4 và thư mục chứa chuỗi ảnh (.jpg/.png)
+    has_video = os.path.exists(video_path)
+    img_files = []
+    if not has_video:
+        cand_dirs = [seq_dir, os.path.join(seq_dir, "img"), os.path.join(seq_dir, "images")]
+        for cd in cand_dirs:
+            if os.path.exists(cd):
+                found = sorted([
+                    os.path.join(cd, f) for f in os.listdir(cd)
+                    if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))
+                ])
+                if found:
+                    img_files = found
+                    break
+
+    if not has_video and not img_files:
+        print(f"Error: Không tìm thấy video ({video_path}) hoặc chuỗi ảnh (.jpg) trong {seq_dir}.")
         metrics_file.close()
         builtins.print = _orig_print
         return None
 
-    cap = cv2.VideoCapture(video_path)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps_video = cap.get(cv2.CAP_PROP_FPS)
+    cap = None
+    if has_video:
+        cap = cv2.VideoCapture(video_path)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps_video = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    else:
+        first_img = cv2.imread(img_files[0])
+        if first_img is None:
+            print(f"Error: Không thể đọc ảnh đầu tiên tại: {img_files[0]}")
+            metrics_file.close()
+            builtins.print = _orig_print
+            return None
+        height, width = first_img.shape[:2]
+        fps_video = 30.0
+        total_frames = len(img_files)
     
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out_vid = cv2.VideoWriter(final_output_path, fourcc, fps_video, (width, height))
@@ -511,7 +539,7 @@ def run_sequence(seq_dir, model, device, transform, cfg, inf_cfg, out_base=None)
     pipeline = SeqReIDPipeline(model, device, inf_cfg)
     
     frame_idx = 0
-    print(f"Starting OOP Sequence Inference Stream for {seq_name}...")
+    print(f"Starting OOP Sequence Inference Stream for {seq_name} ({total_frames} frames)...")
     
     total_processing_time = 0.0
     
@@ -521,9 +549,15 @@ def run_sequence(seq_dir, model, device, transform, cfg, inf_cfg, out_base=None)
         print(f" ⚠️ CẢNH BÁO: absent.txt có {len(absent)} dòng < GT {len(bboxes)} frame. "
               f"Các frame thiếu sẽ được coi là PRESENT (is_absent=False) để pipeline có thể re-acquire.")
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret: break
+    for frame_idx in range(total_frames):
+        if has_video:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                break
+        else:
+            frame = cv2.imread(img_files[frame_idx])
+            if frame is None:
+                break
             
         # Mặc định is_absent = False (present) khi absent.txt thiếu dòng.
         # Trước đây là True (absent) → target bị coi là mất vĩnh viễn ở các frame bị cắt → kết quả tệ âm thầm.
@@ -539,10 +573,9 @@ def run_sequence(seq_dir, model, device, transform, cfg, inf_cfg, out_base=None)
         out_vid.write(display_frame)
         if device.type == 'cuda': torch.cuda.synchronize()
         total_processing_time += time.time() - t_start
-        
-        frame_idx += 1
 
-    cap.release()
+    if cap is not None:
+        cap.release()
     out_vid.release()
     print("Inference completed!")
     
@@ -642,7 +675,16 @@ def main():
     ])
 
     if seq_dir_arg.lower() == "all":
-        base_test_dir = "./data/UAV-Anti-UAV/Test"
+        # Ưu tiên: inf_cfg.test_dir > inf_cfg.data_root > paths.raw_data_dir/Test > fallback ./data/UAV-Anti-UAV/Test
+        configured_test = inf_cfg.get('test_dir') or inf_cfg.get('data_root')
+        if not configured_test:
+            raw_data = cfg.get('paths', {}).get('raw_data_dir', '')
+            if raw_data:
+                configured_test = os.path.join(raw_data, 'Test') if not raw_data.endswith('Test') else raw_data
+        base_test_dir = configured_test if (configured_test and os.path.exists(configured_test)) else "./data/UAV-Anti-UAV/Test"
+        if not os.path.exists(base_test_dir):
+            print(f"Error: Không tìm thấy thư mục test tại: {base_test_dir}")
+            return
         all_dirs = [os.path.join(base_test_dir, d) for d in sorted(os.listdir(base_test_dir)) if os.path.isdir(os.path.join(base_test_dir, d))]
         valid_seqs = []
         for d in all_dirs:

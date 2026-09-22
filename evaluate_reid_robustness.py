@@ -165,7 +165,21 @@ def sample_imposters(data_root, exclude_seq_name, num_imposters, model, transfor
         gt_path = os.path.join(seq_path, "groundtruth_rect.txt")
         absent_path = os.path.join(seq_path, "absent.txt")
         
-        if not os.path.exists(video_path) or not os.path.exists(gt_path): continue
+        has_video = os.path.exists(video_path)
+        img_files = []
+        if not has_video:
+            cand_dirs = [seq_path, os.path.join(seq_path, "img"), os.path.join(seq_path, "images")]
+            for cd in cand_dirs:
+                if os.path.exists(cd):
+                    found = sorted([
+                        os.path.join(cd, f) for f in os.listdir(cd)
+                        if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))
+                    ])
+                    if found:
+                        img_files = found
+                        break
+                        
+        if (not has_video and not img_files) or not os.path.exists(gt_path): continue
             
         absent = []
         if os.path.exists(absent_path):
@@ -192,13 +206,21 @@ def sample_imposters(data_root, exclude_seq_name, num_imposters, model, transfor
         if not valid_starts: continue
             
         start_idx = random.choice(valid_starts)
-        cap = cv2.VideoCapture(video_path)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
+        cap = None
+        if has_video:
+            cap = cv2.VideoCapture(video_path)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
         
         buffer = SlidingWindowBuffer(num_frames, stride=1)
         for j in range(num_frames):
-            ret, frame = cap.read()
-            if not ret: break
+            if has_video:
+                ret, frame = cap.read()
+                if not ret or frame is None: break
+            else:
+                idx = start_idx + j
+                if idx >= len(img_files): break
+                frame = cv2.imread(img_files[idx])
+                if frame is None: break
             
             bbox = bboxes[start_idx + j]
             crop = crop_and_pad(frame, bbox, bbox_padding)
@@ -208,7 +230,8 @@ def sample_imposters(data_root, exclude_seq_name, num_imposters, model, transfor
                 feat = extract_cnn_feature(model, tensor_frame)
                 buffer.add(feat, sharpness)
         
-        cap.release()
+        if cap is not None:
+            cap.release()
         
         if buffer.is_ready():
             visual_mean, fused_feat = compute_fused_vector(model, buffer)
@@ -513,10 +536,39 @@ def main():
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-    cap = cv2.VideoCapture(video_path)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps_video = cap.get(cv2.CAP_PROP_FPS)
+    has_video = os.path.exists(video_path)
+    img_files = []
+    if not has_video:
+        cand_dirs = [seq_dir, os.path.join(seq_dir, "img"), os.path.join(seq_dir, "images")]
+        for cd in cand_dirs:
+            if os.path.exists(cd):
+                found = sorted([
+                    os.path.join(cd, f) for f in os.listdir(cd)
+                    if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))
+                ])
+                if found:
+                    img_files = found
+                    break
+
+    if not has_video and not img_files:
+        print(f"Error: Không tìm thấy video ({video_path}) hoặc chuỗi ảnh trong {seq_dir}")
+        return
+
+    cap = None
+    if has_video:
+        cap = cv2.VideoCapture(video_path)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps_video = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    else:
+        first_img = cv2.imread(img_files[0])
+        if first_img is None:
+            print(f"Error: Không thể đọc ảnh đầu tiên tại: {img_files[0]}")
+            return
+        height, width = first_img.shape[:2]
+        fps_video = 30.0
+        total_frames = len(img_files)
     
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out_vid = cv2.VideoWriter(final_output_path, fourcc, fps_video, (width, height))
@@ -524,12 +576,15 @@ def main():
     data_root = inf_cfg.get('data_root', args.data_root)
     pipeline = SeqRobustnessPipeline(model, device, inf_cfg, data_root, seq_name)
     
-    print(f"Starting OOP Robustness Inference on {seq_name}...")
-    frame_idx = 0
+    print(f"Starting OOP Robustness Inference on {seq_name} ({total_frames} frames)...")
     
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret: break
+    for frame_idx in range(total_frames):
+        if has_video:
+            ret, frame = cap.read()
+            if not ret or frame is None: break
+        else:
+            frame = cv2.imread(img_files[frame_idx])
+            if frame is None: break
             
         is_absent = absent[frame_idx] == 1 if frame_idx < len(absent) else True
         bbox = bboxes[frame_idx] if frame_idx < len(bboxes) else [0,0,0,0]
@@ -540,9 +595,9 @@ def main():
         pipeline.draw_ui(display_frame, bbox, frame_idx)
         
         out_vid.write(display_frame)
-        frame_idx += 1
 
-    cap.release()
+    if cap is not None:
+        cap.release()
     out_vid.release()
     
     print("\n================ ROBUSTNESS REPORT ================")

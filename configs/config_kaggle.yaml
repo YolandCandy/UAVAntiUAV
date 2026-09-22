@@ -1,0 +1,96 @@
+# ============================================================
+# UAVAntiUAV — Kaggle GPU Config (T4 / P100 / Dual T4)
+# Mục đích: Đánh giá suy luận (Inference & Evaluation) chuẩn xác
+#           trên nền tảng Kaggle GPU
+# ============================================================
+
+device:
+  platform: kaggle
+  gpu_jetson: false
+
+# --- Paths (Tự động thích ứng cấu trúc thư mục Kaggle) ---
+paths:
+  # Nơi chứa dataset raw UAV-Anti-UAV trong Kaggle Input
+  raw_data_dir: /kaggle/input/datasets/yolandcandy/uav-anti-uav/Test-002
+  
+  # Thư mục mã nguồn GASNet
+  gasnet_dir: /kaggle/working/UAVAntiUAV/gasnet
+  
+  # Lưu kết quả data_pipeline tạm thời trên Kaggle working
+  data_dir: /kaggle/working/processed
+  
+  # Checkpoint & logs
+  checkpoint_dir: /kaggle/working/checkpoints
+  log_dir: /kaggle/working/logs
+
+# --- Data Pipeline ---
+data_pipeline:
+  num_before_frames: 16
+  num_after_frames: 16
+  bbox_padding: 0.2
+  crop_size: 256
+  num_workers: 4
+  frame_stride: 2
+
+# --- Training Block (tham chiếu num_frames cho eval) ---
+train:
+  # ⚠️ QUAN TRỌNG: num_frames = 12 để đồng bộ độ dài token Bi-Mamba (xem md/15thg9.md)
+  num_frames: 12
+  backbone: dinov3_convnext
+
+# --- Evaluation (Global ReID Retrieval & Verification) ---
+eval:
+  model_path: /kaggle/working/best_model.pth
+  query_json: /kaggle/working/processed/query_test.json
+  gallery_json: /kaggle/working/processed/gallery_test.json
+  output_dir: /kaggle/working/eval_results
+  batch_size: 32
+  num_workers: 4
+  backbone: "dinov3_convnext"
+  backbone_only: false
+  reid_threshold: 0.75
+  intra_sequence: false
+  # fused = qua ReIDHead (BatchNorm1d); pre_bn = cat thô (visual + temporal)
+  space: fused
+  max_correct_vis: 0            # Tắt lưu ảnh crop visual để tiết kiệm I/O & chạy siêu tốc
+  threshold_file: /kaggle/working/calib_results/calibrated_threshold.json
+
+# --- Threshold Calibration (Fixed-FAR 0.1%) ---
+calibration:
+  output_dir: /kaggle/working/calib_results
+  cal_ratio: 0.4                # 40% sequence làm cal-split, 60% làm eval-split
+  far_target: 0.001             # FAR mục tiêu = 0.1%
+  seed: 42
+
+# --- Online Sequence Tracking & ReID Inference (FSM 4 States) ---
+infer:
+  backbone: dinov3_convnext
+  seq_dir: all                  # 'all' hoặc trỏ tới 1 sequence cụ thể
+  test_dir: /kaggle/input/datasets/yolandcandy/uav-anti-uav/Test-002/Test
+  model_path: /kaggle/working/best_model.pth
+  output_video: /kaggle/working/infer_output/output_reid.mp4
+  out_dir: /kaggle/working/infer_output
+  stride: 2
+  # ⚠️ QUAN TRỌNG: Khớp train.num_frames = 12
+  num_frames: 12
+  bbox_padding: 0.2
+  max_anchor_size: 5
+  max_recent_size: 15
+  soft_lock_threshold: 0.30
+  reid_threshold: 0.75
+  hijack_threshold: 0.40
+  hijack_check_count: 5
+  update_interval_sec: 2.0
+  debug_sim: true
+
+# --- Robustness Test (Imposter Distractor Injection) ---
+infer_robustness:
+  seq_dir: /kaggle/input/datasets/yolandcandy/uav-anti-uav/Test-002/Test/UAV-Anti-UAV_Test_000001
+  data_root: /kaggle/input/datasets/yolandcandy/uav-anti-uav/Test-002/Test
+  model_path: /kaggle/working/best_model.pth
+  output_video: /kaggle/working/infer_output/output_robustness.mp4
+  backbone: "dinov3_convnext"
+  reid_threshold: 0.75
+  num_frames: 12
+  bbox_padding: 0.2
+  num_imposters: 10

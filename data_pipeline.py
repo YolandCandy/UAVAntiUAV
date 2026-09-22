@@ -54,8 +54,23 @@ def process_sequence(seq_path, output_base, split, args):
     attr_path = os.path.join(seq_path, "attributes.txt")
     lang_path = os.path.join(seq_path, "language.txt")
     
-    if not all(os.path.exists(p) for p in [video_path, gt_path, absent_path]):
-        return {"status": "error", "message": f"Missing files in {seq_path}"}
+    # Hỗ trợ cả file video .mp4 và thư mục ảnh rời rạc (.jpg/.png)
+    has_video = os.path.exists(video_path)
+    img_files = []
+    if not has_video:
+        cand_dirs = [seq_path, os.path.join(seq_path, "img"), os.path.join(seq_path, "images")]
+        for cd in cand_dirs:
+            if os.path.exists(cd):
+                found = sorted([
+                    os.path.join(cd, f) for f in os.listdir(cd)
+                    if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))
+                ])
+                if found:
+                    img_files = found
+                    break
+                    
+    if (not has_video and not img_files) or not os.path.exists(gt_path) or not os.path.exists(absent_path):
+        return {"status": "error", "message": f"Missing video/images or annotations in {seq_path}"}
         
     # Read files
     try:
@@ -105,11 +120,16 @@ def process_sequence(seq_path, output_base, split, args):
     if not events:
         return {"status": "skipped", "message": f"No disappearance in {seq_path}", "seq_name": seq_name}
         
-    cap = cv2.VideoCapture(video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    if total_frames == 0:
-        return {"status": "error", "message": f"Could not read video {video_path}"}
+    cap = None
+    if has_video:
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames == 0:
+            return {"status": "error", "message": f"Could not read video {video_path}"}
+    else:
+        total_frames = len(img_files)
+        if total_frames == 0:
+            return {"status": "error", "message": f"No image frames found in {seq_path}"}
         
     pairs = []
     
@@ -142,10 +162,17 @@ def process_sequence(seq_path, output_base, split, args):
         
         # Read frames
         for frame_idx in needed_frames:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if not ret:
-                continue
+            if has_video:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    continue
+            else:
+                if frame_idx >= len(img_files):
+                    continue
+                frame = cv2.imread(img_files[frame_idx])
+                if frame is None:
+                    continue
                 
             if frame_idx >= len(bboxes):
                 continue
@@ -182,7 +209,8 @@ def process_sequence(seq_path, output_base, split, args):
                 "attributes": attributes
             })
             
-    cap.release()
+    if cap is not None:
+        cap.release()
     
     return {
         "status": "success",
