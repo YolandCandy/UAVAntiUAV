@@ -241,16 +241,40 @@ def load_checkpoint_verbose(model, checkpoint_path, tag="checkpoint", log=print)
 
         # Tự động ánh xạ (remap) giữa định dạng DINOv3 ConvNeXt và ConvNextModel chuẩn
         if new_k not in model_state:
-            alt_k = new_k
-            if ".stage1.downsample_layers.0." in alt_k:
-                alt_k = alt_k.replace(".stage1.downsample_layers.0.", ".stem.patch_embeddings.")
-            elif ".stage1.downsample_layers.1." in alt_k:
-                alt_k = alt_k.replace(".stage1.downsample_layers.1.", ".stem.layernorm.")
-            elif ".downsample_layers." in alt_k:
-                alt_k = alt_k.replace(".downsample_layers.", ".downsampling_layer.")
+            candidates = [new_k]
             
-            if alt_k in model_state and tuple(v.shape) == tuple(model_state[alt_k].shape):
-                new_k = alt_k
+            # Quy tắc 1: stem & downsampling layers
+            c1 = new_k
+            if ".stage1.downsample_layers.0." in c1:
+                c1 = c1.replace(".stage1.downsample_layers.0.", ".stem.patch_embeddings.")
+            elif ".stage1.downsample_layers.1." in c1:
+                c1 = c1.replace(".stage1.downsample_layers.1.", ".stem.layernorm.")
+            elif ".downsample_layers." in c1:
+                c1 = c1.replace(".downsample_layers.", ".downsampling_layer.")
+            candidates.append(c1)
+            
+            # Quy tắc 2: Layer scale (gamma <-> layer_scale_parameter)
+            c2 = c1
+            if c2.endswith(".gamma"):
+                c2 = c2[:-len(".gamma")] + ".layer_scale_parameter"
+            elif c2.endswith(".layer_scale_parameter"):
+                c2 = c2[:-len(".layer_scale_parameter")] + ".gamma"
+            candidates.append(c2)
+            
+            # Quy tắc 3: Norm & Convs
+            for base_c in [c1, c2]:
+                candidates.append(base_c.replace(".norm.", ".layernorm."))
+                candidates.append(base_c.replace(".norm.", ".layer_norm."))
+                candidates.append(base_c.replace(".layernorm.", ".norm."))
+                candidates.append(base_c.replace(".dwconv.", ".depthwise_conv."))
+                candidates.append(base_c.replace(".pwconv1.", ".pointwise_conv1."))
+                candidates.append(base_c.replace(".pwconv2.", ".pointwise_conv2."))
+                candidates.append(base_c.replace(".norm.", ".layernorm.").replace(".dwconv.", ".depthwise_conv."))
+
+            for cand in candidates:
+                if cand in model_state and tuple(v.shape) == tuple(model_state[cand].shape):
+                    new_k = cand
+                    break
 
         if new_k in model_state and tuple(v.shape) != tuple(model_state[new_k].shape):
             skipped_shape.append((new_k, tuple(v.shape), tuple(model_state[new_k].shape)))
