@@ -686,15 +686,16 @@ def main():
             print(f"Error: Không tìm thấy thư mục test tại: {base_test_dir}")
             return
         all_dirs = [os.path.join(base_test_dir, d) for d in sorted(os.listdir(base_test_dir)) if os.path.isdir(os.path.join(base_test_dir, d))]
-        valid_seqs = []
+        valid_seqs = all_dirs
+        disappearance_seqs = 0
         for d in all_dirs:
             absent_path = os.path.join(d, "absent.txt")
             if os.path.exists(absent_path):
                 with open(absent_path, "r") as f:
                     absent = [int(line.strip()) for line in f if line.strip().isdigit()]
                 if 1 in absent:
-                    valid_seqs.append(d)
-        print(f"Found {len(valid_seqs)} sequences with disappearance events.")
+                    disappearance_seqs += 1
+        print(f"Tổng số chuỗi test được đưa vào suy luận: {len(valid_seqs)} sequences (trong đó có {disappearance_seqs} sequences chứa sự kiện biến mất).")
         
         all_cnn = []
         all_mamba = []
