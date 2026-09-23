@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import builtins
 from torchvision import transforms
 
-from model import UAVReIDNet
+from model import UAVReIDNet, load_checkpoint_verbose
 
 def extract_cnn_feature(model, tensor_frame):
     with torch.no_grad():
@@ -510,17 +510,8 @@ def main():
     model = UAVReIDNet(freeze_backbone=False, backbone=backbone_type)
     model_path = inf_cfg.get('model_path', args.checkpoint)
     if os.path.exists(model_path):
-        checkpoint = torch.load(model_path, map_location='cpu')
-        state_dict = checkpoint.get('model_state_dict', checkpoint)
-        new_state_dict = {}
-        model_state = model.state_dict()
-        for k, v in state_dict.items():
-            new_k = k.replace('_orig_mod.', '') if k.startswith('_orig_mod.') else k
-            if new_k in model_state and v.shape != model_state[new_k].shape:
-                continue
-            new_state_dict[new_k] = v
-        model.load_state_dict(new_state_dict, strict=False)
-        print(f"Loaded weights from {model_path}")
+        # Nạp trọng số đầy đủ qua bộ ánh xạ (remap) ConvNeXt DINOv3 -> 892/892 keys
+        load_checkpoint_verbose(model, model_path, tag="robustness")
     else:
         print(f"WARNING: Checkpoint not found at {model_path}. Running with random weights!")
     
@@ -619,12 +610,14 @@ def main():
         print(f"False Acceptance Rate (FAR): {far*100:.2f}% (Imposter UAV accepted)")
         
         plt.figure(figsize=(10, 6))
-        plt.hist(pipeline.all_genuine_scores, bins=20, alpha=0.6, label='Genuine (True UAV)', color='green')
-        plt.hist(pipeline.all_imposter_scores, bins=20, alpha=0.6, label='Imposter (False UAV)', color='red')
+        # Chuẩn hóa density=True để so sánh công bằng giữa mẫu Thật và Giả dù tỷ lệ là 1-vs-10
+        plt.hist(pipeline.all_genuine_scores, bins=25, alpha=0.6, label='Genuine (True UAV)', color='green', density=True)
+        plt.hist(pipeline.all_imposter_scores, bins=25, alpha=0.6, label='Imposter (False UAV)', color='red', density=True)
         plt.axvline(reid_threshold, color='blue', linestyle='dashed', linewidth=2, label=f'Threshold ({reid_threshold})')
         plt.xlabel('Cosine Similarity Score')
-        plt.ylabel('Frequency')
+        plt.ylabel('Density (Normalized)')
         plt.title('ReID Robustness: Genuine vs Imposter Similarity Distribution')
+        plt.grid(True, alpha=0.3)
         plt.legend()
         
         plot_path = os.path.join(out_dir, "score_distribution.png")
