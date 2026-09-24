@@ -294,7 +294,8 @@ def split_sequences(query_json, cal_ratio, seed):
     for q in queries:
         seq_sample_count[q['sequence_id']] += 1
 
-    all_seqs = list(seq_sample_count.keys())
+    # Sắp xếp danh sách sequence theo thứ tự để đảm bảo tính tất định (100% reproducible) với cùng một seed
+    all_seqs = sorted(list(seq_sample_count.keys()))
     rng = random.Random(seed)
     rng.shuffle(all_seqs)
 

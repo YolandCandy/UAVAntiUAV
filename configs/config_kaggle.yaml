@@ -44,12 +44,12 @@ eval:
   query_json: /kaggle/working/processed/query_test.json
   gallery_json: /kaggle/working/processed/gallery_test.json
   output_dir: /kaggle/working/eval_results
-  batch_size: 32
+  batch_size: 8
   num_workers: 4
   backbone: "dinov3_convnext"
   backbone_only: false
   reid_threshold: 0.75
-  intra_sequence: false
+  intra_sequence: true
   # fused = qua ReIDHead (BatchNorm1d); pre_bn = cat thô (visual + temporal)
   space: fused
   max_correct_vis: 0            # Tắt lưu ảnh crop visual để tiết kiệm I/O & chạy siêu tốc
